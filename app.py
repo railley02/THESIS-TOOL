@@ -1752,7 +1752,7 @@ td{padding:8px 12px;vertical-align:middle}
       within a fixed budget, and measures how three knapsack algorithms perform on the same problem.</p>
     </div>
     <div class="hero-id">
-      <b>Thesis Group 2 — BSCS 3-1N</b>
+      <b>Thesis Group 2 — BSCS 4-1N</b>
       Polytechnic University of the Philippines
     </div>
   </div>
@@ -2988,7 +2988,7 @@ def api_export():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("LGU Budget Optimizer — Thesis Group 2 BSCS 3-1N")
+    print("LGU Budget Optimizer — Thesis Group 2 BSCS 4-1N")
     print(f"  Pasig City:  {len(PASIG_DATA):,} projects")
     print(f"  Quezon City: {len(QC_DATA):,} projects")
     print("=" * 60)
