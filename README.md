@@ -17,8 +17,8 @@ pip install flask pdfplumber openpyxl
 | File | Description |
 |------|-------------|
 | `app.py` | Main Flask application + all 3 algorithms |
-| `pasig_projects.json` | Pasig City APP FY 2025 — 1,979 projects (extracted from PDF) |
-| `qc_projects.json` | Quezon City APP FY 2025 — 26,192 projects (extracted from PDF) |
+| `pasig_projects.json` | Pasig City APP FY 2025 — 1,991 projects (matches manuscript) |
+| `qc_projects.json` | Quezon City APP FY 2025 — 26,865 projects (matches manuscript) |
 
 ## Running
 
@@ -167,3 +167,32 @@ POST /api/run body:
   "gens":     100,
   "mut_rate": 0.03
 }
+
+
+## Dataset Reconciliation
+
+Both datasets were verified against the source APP PDFs and now match the
+counts stated in the manuscript exactly:
+
+| Dataset | Manuscript | PDF (verified) | Tool |
+|---|---|---|---|
+| Pasig City | 1,991 | 1,991 | 1,991 |
+| Quezon City | 26,865 | 26,865 | 26,865 |
+
+Three defects in the earlier extraction were corrected:
+
+1. **Pasig — 7 rows missing.** Rows whose project name wrapped across several
+   lines were lost when the amount did not sit on the same line as the account
+   code.
+2. **Quezon City — 13 rows missing.** Thirteen rows are indented by one space
+   before the account code; the original parser anchored on `^\d{8}` and
+   dropped precisely those.
+3. **Quezon City — one corrupted cost.** "Lunch for Participants at the
+   Heritage & Food Bike Tour (Voucher worth PHP240)" was stored at ₱240.00
+   because the parser matched the amount *inside the project name* instead of
+   the estimated-budget column. Its true cost is ₱240,000.00.
+
+Existing correct records were left untouched; only the missing rows were
+appended and the single bad cost corrected. Sectors for the added rows follow
+the classification already present in the data (e.g. TTMD → Environment,
+matching 87 of the 91 existing TTMD rows).
