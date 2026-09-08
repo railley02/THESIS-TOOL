@@ -2,11 +2,11 @@
 LGU Budget Allocation Optimizer
 ================================
 Hybrid 0/1 Knapsack with Branch-and-Bound and Genetic Algorithm
-BSCS 3-1N · Thesis Group 2 · PUP
+BSCS 4-1N · Thesis Group 2 · PUP
 
 Datasets:
-  - Pasig City APP FY 2025 (General Fund)     — small  (1,984 projects)
-  - Quezon City APP FY 2025 (4th Quarter)     — large  (26,852 projects)
+  - Pasig City APP FY 2025 (General Fund)     — small  (1,991 projects)
+  - Quezon City APP FY 2025 (4th Quarter)     — large  (26,865 projects)
 """
 
 import os, sys, json, time, random, math, re, io
