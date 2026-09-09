@@ -1,15 +1,81 @@
 // ── Landing Page ─────────────────────────────────────────────────────────────
+function goHome(e) {
+  if (e) e.preventDefault();
+  returnToLanding();
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+function goAbout(e) {
+  if (e) e.preventDefault();
+  if (document.getElementById('landing-container').style.display === 'none') {
+    returnToLanding();
+  }
+  setTimeout(() => {
+    const el = document.querySelector('.landing-middle');
+    if (el) {
+      const top = el.getBoundingClientRect().top + window.scrollY - 80;
+      window.scrollTo({top, behavior: 'smooth'});
+    }
+  }, 100);
+}
+
+function goDevelopers(e) {
+  if (e) e.preventDefault();
+  if (document.getElementById('landing-container').style.display === 'none') {
+    returnToLanding();
+  }
+  setTimeout(() => {
+    const el = document.querySelector('.landing-bottom');
+    if (el) {
+      const top = el.getBoundingClientRect().top + window.scrollY - 80;
+      window.scrollTo({top, behavior: 'smooth'});
+    }
+  }, 100);
+}
+
+function goTool(e) {
+  if (e) e.preventDefault();
+  startApp();
+}
+
+// Side nav observer
+document.addEventListener("DOMContentLoaded", () => {
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        document.querySelectorAll('.side-dot').forEach(d => d.classList.remove('active'));
+        if (entry.target.classList.contains('landing-top')) {
+          document.querySelector('.side-dot[data-target="home"]')?.classList.add('active');
+        } else if (entry.target.classList.contains('landing-middle')) {
+          document.querySelector('.side-dot[data-target="about"]')?.classList.add('active');
+        } else if (entry.target.classList.contains('landing-bottom')) {
+          document.querySelector('.side-dot[data-target="devs"]')?.classList.add('active');
+        }
+      }
+    });
+  }, { threshold: 0.3 });
+  
+  document.querySelectorAll('.landing-top, .landing-middle, .landing-bottom').forEach(section => {
+    observer.observe(section);
+  });
+});
+
 function startApp() {
   document.getElementById('landing-container').style.display = 'none';
-  document.getElementById('app-container').style.display = 'block';
+  document.getElementById('app-container').style.display = 'flex';
+  document.getElementById('navTitle').style.display = 'block';
+  document.getElementById('sideNav').style.display = 'none';
   // Fade in
   setTimeout(() => {
     document.getElementById('app-container').style.opacity = '1';
   }, 10);
+  window.scrollTo({top: 0, behavior: 'smooth'});
 }
 
 function returnToLanding() {
   document.getElementById('app-container').style.opacity = '0';
+  document.getElementById('navTitle').style.display = 'none';
+  document.getElementById('sideNav').style.display = 'flex';
   setTimeout(() => {
     document.getElementById('app-container').style.display = 'none';
     document.getElementById('landing-container').style.display = 'flex';
@@ -737,8 +803,26 @@ function exportExcel() {
   window.location.href = '/api/export';
 }
 
-async function clearHistory() {
-  if (!confirm('Clear all recorded runs? This cannot be undone — export first if you still need the data.')) return;
+function clearHistory() {
+  const modal = document.getElementById('clearHistoryModal');
+  modal.style.display = 'flex';
+  // Small delay to allow display:flex to apply before adding opacity class for transition
+  setTimeout(() => {
+    modal.classList.add('show');
+  }, 10);
+}
+
+function closeClearHistoryModal() {
+  const modal = document.getElementById('clearHistoryModal');
+  modal.classList.remove('show');
+  // Wait for transition to finish before hiding
+  setTimeout(() => {
+    modal.style.display = 'none';
+  }, 300);
+}
+
+async function confirmClearHistory() {
+  closeClearHistoryModal();
   try {
     const resp = await fetch('/api/history/clear', {
       method:  'POST',

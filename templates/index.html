@@ -16,6 +16,27 @@
 <!-- Ambient Background Vignette -->
 <div class="bg-vignette"></div>
 
+<!-- Global Top Navigation -->
+<nav class="top-nav">
+  <div class="nav-left">
+    <div class="nav-logo"></div>
+    <div class="nav-title" id="navTitle" style="display: none;">LGU BUDGET OPTIMIZER</div>
+  </div>
+  <div class="nav-right">
+    <a href="#" onclick="goHome(event)">HOME</a>
+    <a href="#" onclick="goAbout(event)">ABOUT</a>
+    <a href="#" onclick="goDevelopers(event)">DEVELOPERS</a>
+    <a href="#" onclick="goTool(event)">TOOL</a>
+  </div>
+</nav>
+
+<!-- Side Navigation Dots -->
+<div class="side-nav" id="sideNav">
+  <div class="side-dot active" data-target="home" onclick="goHome(event)"></div>
+  <div class="side-dot" data-target="about" onclick="goAbout(event)"></div>
+  <div class="side-dot" data-target="devs" onclick="goDevelopers(event)"></div>
+</div>
+
 <!-- Landing Page -->
 <div id="landing-container">
   <section class="landing-top">
@@ -78,7 +99,7 @@
 <div id="app-container" style="display: none;">
 <a class="skip" href="#setup">Skip to run setup</a>
 
-<div class="hero">
+<div class="hero" style="display: none;">
   <div class="hero-inner">
     <div>
       <h1 onclick="returnToLanding()" style="cursor: pointer;" title="Return to Home">LGU Budget Optimizer</h1>
@@ -327,9 +348,27 @@
 </div>
 
 <!-- Email Copy Toast -->
-<div id="emailToast" style="display: none; position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #04292E; color: #E5F4F5; padding: 15px 30px; border-radius: 99px; box-shadow: 0 4px 15px rgba(0,0,0,0.2); z-index: 1000; font-family: 'Work Sans', sans-serif; font-weight: 600;">
+<div id="emailToast" style="display: none; position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%); background: #04292E; color: #E5F4F5; padding: 15px 30px; border-radius: 99px; box-shadow: 0 4px 15px rgba(0,0,0,0.2); z-index: 1000; font-family: 'Work Sans', sans-serif; font-weight: 600;">
   hybridknapsack@gmail.com copied to clipboard!
 </div>
+
+<!-- Clear History Custom Modal -->
+<div id="clearHistoryModal" class="custom-modal" style="display: none;">
+  <div class="custom-modal-content">
+    <h3>Clear History</h3>
+    <p>Clear all recorded runs? This cannot be undone &mdash; export first if you still need the data.</p>
+    <div class="custom-modal-actions">
+      <button class="modal-btn-cancel" onclick="closeClearHistoryModal()">Cancel</button>
+      <button class="modal-btn-confirm" onclick="confirmClearHistory()">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- Global Footer -->
+<footer class="global-footer">
+  <div class="footer-left">Group 2 | BSCS 4-1N</div>
+  <div class="footer-right">Polytechnic University of the Philippines</div>
+</footer>
 
 <script src="{{ url_for('static', filename='main.js') }}"></script>
 
