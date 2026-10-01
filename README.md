@@ -16,9 +16,9 @@ pip install flask pdfplumber openpyxl
 
 | File | Description |
 |------|-------------|
-| `app.py` | Main Flask application + all 3 algorithms |
-| `pasig_projects.json` | Pasig City APP FY 2025 — 1,979 projects (extracted from PDF) |
-| `qc_projects.json` | Quezon City APP FY 2025 — 26,192 projects (extracted from PDF) |
+| `app.py` | Main Flask application + both algorithms |
+| `pasig_projects.json` | Pasig City APP FY 2025 — 1,991 projects (matches manuscript) |
+| `qc_projects.json` | Quezon City APP FY 2025 — 26,865 projects (matches manuscript) |
 
 ## Running
 
@@ -167,3 +167,187 @@ POST /api/run body:
   "gens":     100,
   "mut_rate": 0.03
 }
+
+
+## Dataset Reconciliation
+
+Both datasets were verified against the source APP PDFs and now match the
+counts stated in the manuscript exactly:
+
+| Dataset | Manuscript | PDF (verified) | Tool |
+|---|---|---|---|
+| Pasig City | 1,991 | 1,991 | 1,991 |
+| Quezon City | 26,865 | 26,865 | 26,865 |
+
+Three defects in the earlier extraction were corrected:
+
+1. **Pasig — 7 rows missing.** Rows whose project name wrapped across several
+   lines were lost when the amount did not sit on the same line as the account
+   code.
+2. **Quezon City — 13 rows missing.** Thirteen rows are indented by one space
+   before the account code; the original parser anchored on `^\d{8}` and
+   dropped precisely those.
+3. **Quezon City — one corrupted cost.** "Lunch for Participants at the
+   Heritage & Food Bike Tour (Voucher worth PHP240)" was stored at ₱240.00
+   because the parser matched the amount *inside the project name* instead of
+   the estimated-budget column. Its true cost is ₱240,000.00.
+
+Existing correct records were left untouched; only the missing rows were
+appended and the single bad cost corrected. Sectors for the added rows follow
+the classification already present in the data (e.g. TTMD → Environment,
+matching 87 of the 91 existing TTMD rows).
+
+
+## Interface notes
+
+**Sequential phases.** Each phase ends with a button to the next. The Setup
+phase cannot be left until at least one project is selected.
+
+**Live progress.** Runs stream over Server-Sent Events (`/api/run/stream`).
+Each algorithm has its own lane showing the current trial, last runtime and
+running means, and reports its result the moment it finishes its own trials.
+
+Trials are **interleaved** (trial 1 of each algorithm, then trial 2, and so
+on) rather than run in parallel threads. CPython's global interpreter lock
+means two CPU-bound solvers in threads would compete for one core and inflate
+each other's measured runtimes - the very numbers the paired t-test compares.
+Interleaving keeps every measurement contention-free while still letting both
+progress bars advance together.
+
+
+## Verification performed
+
+- Both algorithms were checked against exhaustive brute-force
+  enumeration on small instances: every result matched the true optimum.
+- The two exact methods were compared on larger random instances (n up to
+  300) with no disagreements.
+- No solution exceeded the budget constraint across repeated runs.
+- t-statistics and p-values were validated against SciPy to ~1e-14.
+- Dataset counts were reconciled against the source APP PDFs
+  (Pasig 1,991; Quezon City 26,865).
+
+
+## Preprocessing (`extract_datasets.py`)
+
+Implements the INPUT and DATA PROCESSING stages of Figure 6 — manual
+download, PDF parsing (rule-based extraction, regex table matching,
+keyword-anchored line parsing), normalization, null handling, and sector
+categorization — producing the JSON the optimizer loads.
+
+It runs once as a preprocessing step, not on every application start:
+parsing 1,707 pages takes far longer than solving the knapsack problem, so
+re-parsing per run would dominate the very timings the study measures.
+
+```
+python extract_datasets.py --pasig PASIG_DATASET.pdf --qc QUEZON_CITY_DATASET.pdf
+```
+
+Output goes to `./extracted/` — deliberately NOT over the live datasets.
+
+### Regenerating datasets already in use
+
+```
+python extract_datasets.py --pasig ... --qc ... --preserve-existing --existing-dir .
+```
+
+Sector, project name and cost all feed the MAUT benefit score, and
+reconstructing a wrapped multi-line project name from a PDF is inherently
+approximate. `--preserve-existing` carries name, PMO and sector across from
+the current dataset by matching on (code, cost), so regeneration cannot shift
+any benefit score. Verified: benefit totals come out identical to the live
+data for both cities.
+
+### Extraction defects this script handles
+
+1. **Wrapped rows (Pasig).** A project name can wrap above and below the line
+   carrying the account code, and the budget is not always on that line. A
+   naive line parser loses 7 rows.
+2. **Indented codes (Quezon City).** 13 rows are indented one space before the
+   account code; anchoring on `^\d{8}` drops exactly those 13.
+3. **Amounts inside project names.** One project reads "(Voucher worth
+   PHP240)"; searching the whole line for a currency amount captures 240
+   instead of the real 240,000.00. Amounts are read only from the
+   estimated-budget column.
+
+
+## Verification & Review phase
+
+Implements step 7 of the Data Generation/Gathering Procedure (post-allocation
+verification and comparative review). The manuscript specifies a MANUAL
+verification phase; the tool establishes the mechanical facts, and the manual
+judgement is recorded in the exported workbook.
+
+**Automated integrity checks** run over every funded project: each appears in
+the source Annual Procurement Plan, each has a positive estimated budget, each
+benefit value falls within the 0-10 scale, the total cost is within the budget
+ceiling, and no project is funded twice.
+
+**Budget utilisation by sector** charts where the funded budget actually went,
+drawn as inline SVG. Read alongside the sector shares: a sector can hold many
+projects yet little spend, or few projects yet a large share.
+
+**Sector alignment** compares each sector's share of the candidate plan with
+its share of the funded set, which is the evidence for whether the allocation
+reflects the local government's own priorities.
+
+**Comparative review** reports candidates, projects funded, budget spent, total
+benefit and benefit per PhP 1 million for each dataset, for the scaling
+question. It appears once an allocation has been run on both cities.
+
+**Funded projects** lists the complete allocation for each city in the tool.
+Pick a dataset and algorithm, then search, filter by sector, sort by benefit,
+cost, benefit per PhP 1 million or name, and page through the results. Paging
+happens on the server, because a Quezon City allocation can exceed 25,000
+projects. It is the same list the export contains.
+
+**The manual review is done in Excel.** Each funded-project sheet carries empty
+**Reviewer verdict** and **Reviewer note** columns, the verdict column having a
+dropdown of aligned / not aligned / flagged. The reviewer therefore works over
+the complete allocation with Excel's filtering and sorting, rather than over a
+sample in the browser, and the completed sheet is the evidence for the manual
+phase.
+
+> The budget matters here. At a generous ceiling nearly every project is funded
+> and the review is uninformative; at a selective budget real trade-offs appear
+> and the sector differences become meaningful. State the budget used.
+
+### Convergence plot
+
+The results panel plots the genetic algorithm's best fitness after each
+generation, with generation 0 being the seeded population, so the curve shows
+whether evolution improved on what the GA started with. Starting fitness,
+final fitness, the improvement and the generation at which the best value was
+reached are reported beneath it.
+
+If the GA does not improve on its seed, the panel says so explicitly: its
+solution equals the greedy solution, which branch-and-bound obtains on its own.
+
+### Funded project sheets
+
+The export includes one sheet per city - **Funded - Pasig** and
+**Funded - Quezon City** - each listing every project funded by the most
+recent run, with an Algorithm column so both variations can be compared within
+the same city. Columns: account code, project name, implementing office,
+sector, cost, benefit, and benefit per PhP 1 million.
+
+Each sheet carries the budget ceiling at the top, an autofilter and a frozen
+header, and per-algorithm totals at the bottom written as live SUMIF formulas
+so they follow any filtering or editing.
+
+A third sheet, **Funded - All**, repeats the same rows with a Dataset column
+and its header on row 1, so both cities can be compared in a single
+PivotTable - something the split sheets cannot do. Because it duplicates every
+row it roughly doubles the workbook: about 9 MB and 20 seconds, against 4.5 MB
+and 10 seconds without it. The checkbox beside the Export button controls
+whether it is included.
+
+This is the complete allocation, as distinct from the purposive sample used in
+the manual review. At a selective budget the Quezon City sheet runs to roughly
+52,000 rows.
+
+
+## Defaults
+
+The run setup opens with **both algorithms selected and 30 independent runs**,
+matching Chapter 3 steps 5-6. Lower the run count for a quick demonstration;
+keep it at 30 when collecting the data to be reported.
