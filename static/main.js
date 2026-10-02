@@ -1180,7 +1180,7 @@ function renderVerify() {
     </div>
 
     <div class="card" style="margin-top:14px">
-      <div class="card-hdr"><div class="card-title">Budget utilisation by sector</div>
+      <div class="card-hdr"><div class="card-title">Budget utilization by sector</div>
         <div class="card-meta">₱${r.total_cost.toLocaleString(undefined,{maximumFractionDigits:0})} of
           ₱${r.budget.toLocaleString(undefined,{maximumFractionDigits:0})}
           (${(r.total_cost / r.budget * 100).toFixed(1)}% of the ceiling)</div></div>
