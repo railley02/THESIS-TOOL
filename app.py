@@ -2,18 +2,19 @@
 LGU Budget Allocation Optimizer
 ================================
 Hybrid 0/1 Knapsack with Branch-and-Bound and Genetic Algorithm
-BSCS 3-1N · Thesis Group 2 · PUP
+BSCS 4-1N · Thesis Group 2 · PUP
 
 Datasets:
-  - Pasig City APP FY 2025 (General Fund)     — small  (1,984 projects)
-  - Quezon City APP FY 2025 (4th Quarter)     — large  (26,852 projects)
+  - Pasig City APP FY 2025 (General Fund)     — small  (1,991 projects)
+  - Quezon City APP FY 2025 (4th Quarter)     — large  (26,865 projects)
 """
 
 import os, sys, json, time, random, math, re, io
 from pathlib import Path
-from collections import deque, OrderedDict
+from collections import deque, OrderedDict, Counter as collections_Counter
 from datetime import datetime
-from flask import Flask, render_template_string, request, jsonify, send_file
+from flask import (Flask, render_template, request, jsonify, send_file,
+                   Response, stream_with_context)
 
 # random.binomialvariate is available from Python 3.12+. It lets the GA draw
 # the number of mutations in O(1) instead of one random() call per gene.
@@ -198,100 +199,6 @@ for ds in DATASETS.values():
 # Knapsack algorithms (pure Python — no numpy/scipy dependency)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def knapsack_dp(items, capacity):
-    """Classic 0/1 Knapsack via Dynamic Programming.
-    Time:  O(n·W)   where W = capacity / UNIT
-    Space: O(n·W)
-    """
-    n = len(items)
-    if n == 0:
-        return {"selected": [], "total_benefit": 0.0, "pruning_rate": None, "exec_ms": 0.0}
-
-    # Standard (non-adaptive) DP table resolution.
-    #
-    # The 0/1 knapsack DP works over an INTEGER weight axis, but project
-    # costs are real-valued pesos. The standard way to apply DP here is to
-    # discretize cost into UNIT-sized buckets, giving a table of size
-    # n * W where W = capacity / UNIT. MAX_W fixes the budget-axis
-    # resolution independent of n - there are NO scaling heuristics, so
-    # the table (and DP's runtime) grows linearly with n. This is what
-    # makes plain DP the slowest of the three algorithms on large inputs.
-    #
-    # Weights are discretized with round() (nearest bucket) rather than
-    # ceil(). ceil() systematically over-charges EVERY item by up to one
-    # unit; across thousands of items that bias accumulates into a large
-    # phantom weight (e.g. ~25,000 units on the full QC dataset), which can
-    # make a set of projects that truly fits the budget appear infeasible -
-    # causing DP to leave large amounts of budget unused and report a badly
-    # low benefit. round() is unbiased: per-item rounding errors cancel
-    # rather than accumulate, so DP fills the budget correctly.
-    #
-    # Because round() can occasionally UNDER-charge a selection (the opposite
-    # bias), a final feasibility repair drops the lowest benefit/cost items
-    # until the TRUE cost is within budget. This guarantees DP never returns
-    # an over-budget result while keeping it unbiased.
-    #
-    # On datasets with an extreme cost range (QC spans PhP 6 to PhP 2.1B),
-    # no fixed-resolution grid can represent both tiny and huge items
-    # exactly, so DP may still report a value below the true optimum on very
-    # large, loosely-budgeted selections. That is a GENUINE, well-known
-    # limitation of discretized DP on continuous costs - not a bug and not
-    # bias - and it is reported honestly. B&B and B&B+GA operate on exact
-    # costs and so are always exact.
-    #
-    # MAX_W is held FIXED for ALL n. The decision-bit table is bit-packed
-    # (one bytearray row of ceil((W+1)/8) bytes per item), so even selecting
-    # the entire QC dataset (n ~ 26,852) needs only ~67 MB. DP always
-    # finishes; it simply takes longer for large inputs, which is the
-    # honest, expected cost of the standard algorithm.
-    MAX_W = 20_000
-    UNIT  = max(1, int(math.ceil(capacity / MAX_W)))
-    W     = int(capacity // UNIT)
-
-    # 1-D rolling DP values + bit-packed decision table (keep[i] is a
-    # bytearray; bit j set means "item i was taken to achieve dp[j]").
-    dp = [0.0] * (W + 1)
-    row_bytes = (W // 8) + 1
-    keep = [None] * n
-
-    _t_exec = time.perf_counter()          # core solve only (excl. setup)
-    for i, item in enumerate(items):
-        w = max(1, int(round(item["cost"] / UNIT)))  # nearest bucket, >=1
-        bits = bytearray(row_bytes)
-        if w <= W:                                    # else item alone exceeds W
-            v = item["benefit"]
-            for j in range(W, w - 1, -1):
-                cand = dp[j - w] + v
-                if cand > dp[j]:
-                    dp[j] = cand
-                    bits[j >> 3] |= (1 << (j & 7))
-        keep[i] = bits
-
-    # Traceback over the bit-packed decision table
-    selected, j = [], W
-    for i in range(n - 1, -1, -1):
-        if keep[i][j >> 3] & (1 << (j & 7)):
-            selected.append(i)
-            j -= max(1, int(round(items[i]["cost"] / UNIT)))
-
-    # Budget-safety repair: round() can under-charge, so the selected set's
-    # TRUE cost might marginally exceed the budget. Drop lowest benefit/cost
-    # items until feasible (guarantees DP never reports an over-budget plan).
-    used = sum(items[i]["cost"] for i in selected)
-    if used > capacity:
-        selected.sort(key=lambda i: items[i]["benefit"] / max(items[i]["cost"], 1))
-        k = 0
-        while used > capacity and k < len(selected):
-            used -= items[selected[k]]["cost"]
-            k += 1
-        selected = selected[k:]
-
-    total_benefit = sum(items[i]["benefit"] for i in selected)
-    _exec_ms = (time.perf_counter() - _t_exec) * 1000
-
-    return {"selected": selected, "total_benefit": total_benefit, "pruning_rate": None, "nodes_generated": None, "nodes_pruned": None, "exec_ms": round(_exec_ms, 2), "ga_terminated": False}
-
-
 def knapsack_bnb(items, capacity):
     """0/1 Knapsack via Best-First Branch-and-Bound (max-heap on upper bound).
 
@@ -393,7 +300,7 @@ def knapsack_bnb(items, capacity):
 
 
 def knapsack_bnb_ga(items, capacity,
-                    pop_size=40, generations=60, mutation_rate=0.03):
+                    pop_size=40, generations=60, mutation_rate=None):
     """Hybrid 0/1 Knapsack: Genetic Algorithm seeds Best-First Branch-and-Bound.
 
     Phase 1 - Genetic Algorithm:
@@ -480,17 +387,26 @@ def knapsack_bnb_ga(items, capacity,
         return tc, tb
 
     def repair_tracked(chrom, total_cost):
-        """Drop lowest benefit/cost items until feasible. Returns new cost.
-        Identical result to a full re-summed repair, but updates cost
-        incrementally as items are removed."""
-        if total_cost <= capacity:
-            return total_cost
-        for i in reversed(ratio_order):
-            if total_cost <= capacity:
-                break
-            if chrom[i]:
-                chrom[i] = 0
-                total_cost -= costs[i]
+        """Chu & Beasley (1998) repair operator: DROP then ADD.
+
+        DROP removes the lowest benefit/cost items until the chromosome is
+        within budget; ADD then spends any leftover budget on the highest
+        benefit/cost items that still fit. Without the ADD phase a mutation
+        that added a project left the freed budget unspent, so offspring were
+        almost always worse than their parents and the GA never produced a
+        seed better than the greedy solution.
+        """
+        if total_cost > capacity:
+            for i in reversed(ratio_order):
+                if total_cost <= capacity:
+                    break
+                if chrom[i]:
+                    chrom[i] = 0
+                    total_cost -= costs[i]
+        for i in ratio_order:
+            if not chrom[i] and costs[i] <= capacity - total_cost:
+                chrom[i] = 1
+                total_cost += costs[i]
         return total_cost
 
     def fitness(chrom):
@@ -546,7 +462,7 @@ def knapsack_bnb_ga(items, capacity,
                 chrom[i] ^= 1
         return chrom
 
-    # Initialise population
+    # Initialize population
     _t_exec = time.perf_counter()          # core solve: GA evolution + B&B (excl. sort/prefix/helpers)
     pop  = [greedy_chrom(jitter=k) for k in range(pop_size // 2)]
     pop += [random_chrom()         for _ in range(pop_size - len(pop))]
@@ -565,9 +481,17 @@ def knapsack_bnb_ga(items, capacity,
     # greedy-seeded population typically converges within a handful of
     # generations), which otherwise adds large overhead for no better seed.
     # The B&B phase that follows is unchanged and identical to plain B&B.
-    mr = max(1 / n, mutation_rate)
+    # Mutation defaults to 1/n - one expected flip per chromosome (Back, 1993).
+    # A fixed 3% flipped ~60 genes on Pasig and ~800 on Quezon City, which
+    # destroys a near-optimal solution rather than refining it.
+    mr = (1.0 / n) if mutation_rate is None else max(1.0 / n, mutation_rate)
     patience = 8
     gens_since_improve = 0
+    # Best fitness after each generation, for the convergence plot. Includes
+    # the seeded population at generation 0, so the plot shows what the GA
+    # started from and whether evolution improved on it.
+    convergence = [round(ga_best_fit, 6)]
+
     for _ in range(generations):
         # Elitism: keep top-2
         ranked = sorted(range(len(pop)), key=lambda x: fits[x], reverse=True)
@@ -589,12 +513,12 @@ def knapsack_bnb_ga(items, capacity,
                 if child[i]:
                     tc += costs[i]
                     tb += benefits[i]
-            if tc > capacity:
-                tc = repair_tracked(child, tc)
-                tb = 0.0
-                for i in range(n):
-                    if child[i]:
-                        tb += benefits[i]
+            # Always repair: DROP restores feasibility, ADD spends leftover budget.
+            tc = repair_tracked(child, tc)
+            tb = 0.0
+            for i in range(n):
+                if child[i]:
+                    tb += benefits[i]
             f = tb
             new_pop.append(child)
             new_fits.append(f)
@@ -605,6 +529,7 @@ def knapsack_bnb_ga(items, capacity,
 
         pop, fits = new_pop, new_fits
 
+        convergence.append(round(ga_best_fit, 6))
         gens_since_improve = 0 if improved else gens_since_improve + 1
         if gens_since_improve >= patience:
             break
@@ -659,11 +584,12 @@ def knapsack_bnb_ga(items, capacity,
         else:
             np_ += 1
 
-    pruning_rate = round((np_ / ng * 100), 2) if ng > 0 else 0.0
+    pruning_rate = round((np_ / ng * 100), 2) if ng > 0 else 0.0 #PRUNING
     _exec_ms = (time.perf_counter() - _t_exec) * 1000
     return {"selected": best_set, "total_benefit": best_val,
             "pruning_rate": pruning_rate, "nodes_generated": ng,
-            "nodes_pruned": np_, "exec_ms": round(_exec_ms, 2), "ga_terminated": False}
+            "nodes_pruned": np_, "exec_ms": round(_exec_ms, 2), "ga_terminated": False,
+            "convergence": convergence, "ga_seed": round(ga_best_fit, 6)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -693,7 +619,6 @@ RUN_HISTORY = {}          # "ds|algo" -> deque of trial dicts
 ALGO_SHEET_NAMES = OrderedDict([
     ("bnb", "KB (Pure B&B)"),
     ("ga",  "KBG (B&B + GA)"),
-    ("dp",  "DP (Baseline)"),
 ])
 DS_NAMES = {"pasig": "Pasig City (Small)", "qc": "Quezon City (Large)"}
 
@@ -729,6 +654,25 @@ def record_trial(ds, algo, result, budget, n_candidates, ga_params):
         "generations":      ga_params.get("gens")     if algo == "ga" else None,
         "mutation_rate":    ga_params.get("mut_rate") if algo == "ga" else None,
     })
+
+
+
+# Funded projects of the most recent run for each dataset+algorithm, kept so
+# the export can list every funded project for review. Holds references to the
+# existing project records rather than copies.
+FUNDED_LATEST = {}   # "ds|algo" -> {"budget":…, "items":[…], "timestamp":…}
+
+
+def record_funded(ds, algo, items, selected_idx, budget, session=""):
+    # "session" identifies the browser page that started the run. The funded
+    # browser only lists allocations from the current page's session, so a
+    # city that was run earlier (before a refresh) does not reappear when only
+    # the other city is run now.
+    FUNDED_LATEST[f"{ds}|{algo}"] = {
+        "ds": ds, "algo": algo, "budget": budget, "session": session,
+        "items": [items[i] for i in selected_idx if 0 <= i < len(items)],
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 def history_summary():
@@ -827,9 +771,9 @@ def t_p_two_tailed(t, df):
     return _betai(0.5 * df, 0.5, df / (df + t * t))
 
 
-def s_mean(v):                                   # Equation 2
-    return sum(v) / len(v) if v else None
-
+def s_mean(v):                                   # Equation 2 #SOP 1
+    return sum(v) / len(v) if v else None        # this calculates the sum of the values in the list v (parameter)
+                                                 # and divides it by the length of v (number of trials) to get the mean
 
 def s_variance(v):                               # Equation 3
     n = len(v)
@@ -843,70 +787,116 @@ def s_stdev(v):
     var = s_variance(v)
     return math.sqrt(var) if var is not None else None
 
-
+# SOP 3: compares KB (a) against KBG (b) on the SAME city
 def paired_t_test(a, b):
     """Equations 4-7. Compares two related sets measured on the same instances."""
+
+    # Number of pairs: trial 1 of KB pairs with trial 1 of KBG, and so on.
+    # If one list is longer, only the matching pairs are used.
     n = min(len(a), len(b))
+
+    # A standard deviation needs at least 2 pairs, so with fewer the test is skipped
     if n < 2:
         return {"n": n, "note": "Not enough paired runs (at least 2 required)."}
 
+    # Difference of each pair: KB's value minus KBG's value in the same trial
     diffs = [a[i] - b[i] for i in range(n)]       # Equation 6
+
+    # Mean difference: the average of those differences
     d_bar = s_mean(diffs)                         # Equation 5
+
+    # Standard deviation of the differences: how much the gap varies run to run
     sd    = s_stdev(diffs)                        # Equation 7
 
+    # The result, filled in step by step below
     out = {
-        "n": n, "mean_a": s_mean(a[:n]), "mean_b": s_mean(b[:n]),
-        "mean_diff": d_bar, "sd_diff": sd, "df": n - 1,
-        "t": None, "p": None, "significant": None, "note": None,
+        "n": n, "mean_a": s_mean(a[:n]), "mean_b": s_mean(b[:n]),   # pairs; "Mean (KB)", "Mean (KBG)"
+        "mean_diff": d_bar, "sd_diff": sd, "df": n - 1,             # "Mean diff.", "SD of diff."; df = n − 1
+        "t": None, "p": None, "significant": None, "note": None,    # test results, set below
     }
 
     # A deterministic metric (e.g. branch-and-bound pruning rate) produces
     # constant differences, so the standard deviation is zero and t is
     # undefined. That is a property of the algorithm, not a failure, so it is
     # reported plainly instead of being hidden or faked.
-    if sd is None or sd == 0:
+    if sd is None or sd == 0:            # every pair differs by the same amount (e.g. pruning rate)
         out["note"] = ("Differences are constant, so the standard deviation is zero and "
                        "t cannot be computed. Expected for deterministic metrics such as "
                        "the pruning rate of branch-and-bound.")
-        return out
+        return out                       # no test: shown as "constant"
 
+    # t statistic: mean difference ÷ its standard error (sd ÷ √n)
     t = d_bar / (sd / math.sqrt(n))               # Equation 4
+
+    # Store t in the result
     out["t"] = t
+
+    # Two-tailed p-value with n − 1 degrees of freedom:
+    # the chance of a mean difference this large if KB and KBG truly performed the same
     out["p"] = t_p_two_tailed(t, n - 1)
+
+    # Significant if p < 0.05 → reject H₀ (KB and KBG differ on this metric)
     out["significant"] = (out["p"] is not None and out["p"] < 0.05)
+
+    # This becomes one row of the statistical report
     return out
 
-
+# SOP 2: compares ONE algorithm's runs on Pasig (a) against Quezon City (b)
 def independent_t_test(a, b):
     """Equation 1. Unpooled (Welch) form, exactly as written in the manuscript."""
+
+    # Number of runs in each group (up to 30 per city)
     n1, n2 = len(a), len(b)
+
+    # A variance needs at least 2 values, so with fewer runs the test is skipped
     if n1 < 2 or n2 < 2:
         return {"n1": n1, "n2": n2, "note": "Not enough runs in one or both groups."}
 
+    # Mean of each group: sum ÷ number of runs
     m1, m2 = s_mean(a), s_mean(b)
+
+    # Sample variance of each group: Σ(x − mean)² ÷ (n − 1)
     v1, v2 = s_variance(a), s_variance(b)
 
+    # The result, filled in step by step below
     out = {
-        "n1": n1, "n2": n2, "mean_1": m1, "mean_2": m2,
-        "var_1": v1, "var_2": v2, "ratio": None,
-        "t": None, "df": None, "p": None, "significant": None, "note": None,
+        "n1": n1, "n2": n2, "mean_1": m1, "mean_2": m2,     # run counts and means: "Mean (Pasig)", "Mean (QC)"
+        "var_1": v1, "var_2": v2, "ratio": None,           # variances; ratio is set below
+        "t": None, "df": None, "p": None, "significant": None, "note": None,   # test results, set below
     }
+
     # Efficiency, per the Definition of Terms: the ratio of the optimality
     # parameter on the small dataset relative to the large dataset.
-    if m2 not in (None, 0):
-        out["ratio"] = m1 / m2
+    if m2 not in (None, 0):          # avoid dividing by zero
+        out["ratio"] = m1 / m2       # efficiency ratio = Pasig mean ÷ Quezon City mean
 
+    # Squared standard error of the difference between the means.
+    # Each group keeps its own variance (unpooled), which is what makes this Welch's test.
     se_sq = v1 / n1 + v2 / n2
+
+    # If both groups never vary (e.g. pruning rate), the standard error is 0
+    # and t would divide by zero, so no test is run: shown as "constant"
     if se_sq <= 0:
         out["note"] = ("Both groups are constant, so the standard error is zero and t "
                        "cannot be computed. Expected for deterministic metrics.")
         return out
 
+    # t statistic: how many standard errors apart the two means are
     t  = (m1 - m2) / math.sqrt(se_sq)             # Equation 1
+
+    # Welch–Satterthwaite degrees of freedom (usually not a whole number, e.g. 29.57)
     df = (se_sq ** 2) / ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1))
+
+    # Store t and df in the result
     out["t"], out["df"] = t, df
+
+    # Two-tailed p-value: the chance of a difference this large if the true means were equal
     out["p"] = t_p_two_tailed(t, df)
+
+    # Significant if p < 0.05 → reject H₀ (performance differs between dataset sizes)
     out["significant"] = (out["p"] is not None and out["p"] < 0.05)
+
+    # This becomes one row of the statistical report
     return out
 
 
@@ -971,11 +961,17 @@ _METRICS = [
 ]
 
 
-def build_workbook():
-    """Build the experiment workbook and return it as an in-memory buffer."""
+def build_workbook(include_combined=True):
+    """Build the experiment workbook and return it as an in-memory buffer.
+
+    include_combined adds a 'Funded - All' sheet that repeats every funded
+    row with a Dataset column, for cross-city PivotTables. It roughly
+    doubles the file size and build time, so it can be switched off.
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
 
     FONT = "Arial"
     hdr_font   = Font(name=FONT, bold=True, size=11, color="FFFFFF")
@@ -1067,7 +1063,10 @@ def build_workbook():
                 letter = get_column_letter(col)
                 ws.cell(
                     row=row, column=col,
-                    value=f"={fn}({letter}{first_data_row}:{letter}{last_data_row})",
+                    # Wrapped in IFERROR so a sheet exported before both
+                    # datasets have been run shows blanks rather than
+                    # #DIV/0! across the empty columns.
+                    value=f'=IFERROR({fn}({letter}{first_data_row}:{letter}{last_data_row}),"")',
                 )
             for col in range(1, 8):
                 c = ws.cell(row=row, column=col)
@@ -1144,7 +1143,7 @@ def build_workbook():
                 _cell(r, 7, row.get("df"),     "0.00")
                 pc = _cell(r, 8, row.get("p"), "0.000000")
                 if row.get("p") is None:
-                    pc.value = "not computable"
+                    pc.value = "constant"
                     pc.font = Font(name=FONT, size=9, italic=True)
                 r += 1
         r += 1
@@ -1164,7 +1163,7 @@ def build_workbook():
                 _cell(r, 7, row.get("t"),         "0.0000")
                 pc = _cell(r, 8, row.get("p"), "0.000000")
                 if row.get("p") is None:
-                    pc.value = "not computable"
+                    pc.value = "constant"
                     pc.font = Font(name=FONT, size=9, italic=True)
                 r += 1
 
@@ -1175,9 +1174,9 @@ def build_workbook():
             "df follows the Welch-Satterthwaite approximation.",
             "Paired t-test follows Equations 4-7. Runs are paired by problem instance: "
             "both algorithms solve the identical project set under the identical budget.",
-            "'not computable' means the metric is constant across runs, so its standard "
-            "deviation is zero. This is expected for the pruning rate of branch-and-bound, "
-            "which is deterministic, and is not a data error.",
+            "'constant' means the metric did not change across runs, so its standard "
+            "deviation is zero and no t-test can be computed. This is expected for the "
+            "pruning rate of branch-and-bound, which is deterministic, and is not a data error.",
         ]:
             c = st.cell(row=r, column=1, value=line)
             c.font = Font(name=FONT, size=9, italic=True)
@@ -1215,7 +1214,7 @@ def build_workbook():
 
     metric_keys = [("runtime_ms", "Runtime"), ("exec_ms", "ExecTime"), ("pruning_rate", "Pruning")]
     ds_short    = [("pasig", "Pasig"), ("qc", "QC")]
-    algo_short  = [("bnb", "KB"), ("ga", "KBG"), ("dp", "DP")]
+    algo_short  = [("bnb", "KB"), ("ga", "KBG")]
     metric_desc = {
         "Runtime":  "Active algorithm execution only, in milliseconds",
         "ExecTime": "Total duration including setup and output, in milliseconds",
@@ -1297,6 +1296,151 @@ def build_workbook():
             c.alignment = Alignment(wrap_text=True, vertical="top")
             cb.row_dimensions[note_r + i].height = 26
 
+    # ── Funded projects, one sheet per city ────────────────────────────────
+    # Split by dataset so each city can be analysed on its own, rather than
+    # scrolling one 55,000-row table. Each sheet still carries an Algorithm
+    # column, because both variations are listed together for comparison, and
+    # an autofilter so a single algorithm or sector can be isolated.
+    if FUNDED_LATEST:
+        for ds, ds_label, sheet_name in (("pasig", DS_NAMES["pasig"], "Funded - Pasig"),
+                                         ("qc",    DS_NAMES["qc"],    "Funded - Quezon City")):
+            blocks = [(ALGO_SHEET_NAMES[a], FUNDED_LATEST[f"{ds}|{a}"])
+                      for a in ALGO_SHEET_NAMES if f"{ds}|{a}" in FUNDED_LATEST]
+            if not blocks:
+                continue
+
+            fp = wb.create_sheet(sheet_name)
+            fp["A1"] = f"Funded Projects \u2014 {ds_label}"
+            fp["A1"].font = title_font
+            fp.merge_cells("A1:J1")
+            fp.row_dimensions[1].height = 22
+
+            budget = blocks[0][1]["budget"]
+            fp["A2"] = f"Budget ceiling: PHP {budget:,.2f}"
+            fp["A2"].font = Font(name=FONT, size=10, italic=True)
+            fp.merge_cells("A2:J2")
+
+            # The last two columns are left empty for the manual verification
+            # phase: the reviewer records the judgement here, over the complete
+            # allocation, with Excel's filtering and sorting available.
+            fp_cols = [("Algorithm", 22), ("Account Code", 15),
+                       ("Project / Program", 62), ("Implementing Office", 26),
+                       ("Sector", 19), ("Cost (PhP)", 16), ("Benefit", 10),
+                       ("Benefit per PhP 1M", 18),
+                       ("Reviewer verdict", 18), ("Reviewer note", 46)]
+            hdr_row = 4
+            for col, (head, width) in enumerate(fp_cols, start=1):
+                c = fp.cell(row=hdr_row, column=col, value=head)
+                c.font = hdr_font
+                c.fill = hdr_fill
+                c.alignment = center
+                c.border = border
+                fp.column_dimensions[get_column_letter(col)].width = width
+            fp.row_dimensions[hdr_row].height = 26
+
+            # The same Font instance is reused across rows: a city allocation
+            # can run to tens of thousands of rows.
+            r = hdr_row + 1
+            for label, rec in blocks:
+                for it in rec["items"]:
+                    cost = float(it["cost"])
+                    ben = compute_benefit(it)
+                    fp.cell(row=r, column=1, value=label).font = body_font
+                    fp.cell(row=r, column=2, value=str(it.get("code", ""))).font = body_font
+                    fp.cell(row=r, column=3, value=it.get("name", "")).font = body_font
+                    fp.cell(row=r, column=4, value=it.get("pmo", "")).font = body_font
+                    fp.cell(row=r, column=5, value=it.get("sector", "")).font = body_font
+                    c6 = fp.cell(row=r, column=6, value=round(cost, 2))
+                    c6.font = body_font; c6.number_format = "#,##0.00"
+                    c7 = fp.cell(row=r, column=7, value=round(ben, 3))
+                    c7.font = body_font; c7.number_format = "0.000"
+                    c8 = fp.cell(row=r, column=8,
+                                 value=round(ben / (cost / 1e6), 4) if cost else None)
+                    c8.font = body_font; c8.number_format = "0.0000"
+                    r += 1
+
+            last = r - 1
+            if last > hdr_row:
+                fp.auto_filter.ref = f"A{hdr_row}:J{last}"
+                # Dropdown on the verdict column so the entries stay consistent
+                # and can be filtered or counted afterwards.
+                dv = DataValidation(
+                    type="list",
+                    formula1='"aligned,not aligned,flagged"',
+                    allow_blank=True, showDropDown=False,
+                )
+                dv.prompt = ("Does this allocation align with the local government's "
+                             "development priorities?")
+                dv.promptTitle = "Manual verification"
+                fp.add_data_validation(dv)
+                dv.add(f"I{hdr_row + 1}:I{last}")
+            fp.freeze_panes = f"A{hdr_row + 1}"
+
+            # Per-algorithm totals, as live formulas over this sheet only.
+            tot = last + 2
+            fp.cell(row=tot, column=1, value="Totals").font = mean_font
+            for label, rec in blocks:
+                tot += 1
+                fp.cell(row=tot, column=1, value=label).font = body_font
+                fp.cell(row=tot, column=2, value=f"{len(rec['items']):,} projects").font = body_font
+                cf = fp.cell(row=tot, column=6,
+                             value=f'=SUMIF(A{hdr_row + 1}:A{last},A{tot},F{hdr_row + 1}:F{last})')
+                cf.font = mean_font; cf.number_format = "#,##0.00"
+                bf = fp.cell(row=tot, column=7,
+                             value=f'=SUMIF(A{hdr_row + 1}:A{last},A{tot},G{hdr_row + 1}:G{last})')
+                bf.font = mean_font; bf.number_format = "0.000"
+
+    # ── Funded projects, both cities combined (optional) ───────────────────
+    # The per-city sheets above are for reading; this one is for pivoting. It
+    # repeats the same rows with a Dataset column so a PivotTable can compare
+    # the two cities in a single field - which the split sheets cannot do.
+    if FUNDED_LATEST and include_combined:
+        allfp = wb.create_sheet("Funded - All")
+        all_cols = [("Dataset", 20), ("Algorithm", 22), ("Account Code", 15),
+                    ("Project / Program", 62), ("Implementing Office", 26),
+                    ("Sector", 19), ("Cost (PhP)", 16), ("Benefit", 10),
+                    ("Benefit per PhP 1M", 18)]
+        for col, (head, width) in enumerate(all_cols, start=1):
+            c = allfp.cell(row=1, column=col, value=head)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = center
+            c.border = border
+            allfp.column_dimensions[get_column_letter(col)].width = width
+        allfp.row_dimensions[1].height = 26
+
+        # Header on row 1 with no title above it, so the range can be selected
+        # directly as a PivotTable source.
+        r = 2
+        for algo in ALGO_SHEET_NAMES:
+            for ds in ("pasig", "qc"):
+                rec = FUNDED_LATEST.get(f"{ds}|{algo}")
+                if not rec:
+                    continue
+                label, dsname = ALGO_SHEET_NAMES[algo], DS_NAMES[ds]
+                for it in rec["items"]:
+                    cost = float(it["cost"])
+                    ben = compute_benefit(it)
+                    allfp.cell(row=r, column=1, value=dsname).font = body_font
+                    allfp.cell(row=r, column=2, value=label).font = body_font
+                    allfp.cell(row=r, column=3, value=str(it.get("code", ""))).font = body_font
+                    allfp.cell(row=r, column=4, value=it.get("name", "")).font = body_font
+                    allfp.cell(row=r, column=5, value=it.get("pmo", "")).font = body_font
+                    allfp.cell(row=r, column=6, value=it.get("sector", "")).font = body_font
+                    c7 = allfp.cell(row=r, column=7, value=round(cost, 2))
+                    c7.font = body_font; c7.number_format = "#,##0.00"
+                    c8 = allfp.cell(row=r, column=8, value=round(ben, 3))
+                    c8.font = body_font; c8.number_format = "0.000"
+                    c9 = allfp.cell(row=r, column=9,
+                                    value=round(ben / (cost / 1e6), 4) if cost else None)
+                    c9.font = body_font; c9.number_format = "0.0000"
+                    r += 1
+
+        last = r - 1
+        if last >= 2:
+            allfp.auto_filter.ref = f"A1:I{last}"
+        allfp.freeze_panes = "A2"
+
     # ── Raw run log: every recorded trial, all captured fields ─────────────
     log = wb.create_sheet("Run Log")
     log_cols = [
@@ -1361,10 +1505,33 @@ def build_workbook():
     return buf
 
 
+# Display label and theoretical complexity per algorithm. Defined at module
+# level so both the plain and the streaming run endpoints share one source of
+# truth for these strings.
+ALGO_META = {
+    # Best-first search stores its open subproblems in a priority queue, which
+    # can grow exponentially in the worst case - hence O(2ⁿ) space, not O(n).
+    # (O(n) would be correct for a depth-first traversal, which keeps only the
+    # current path.) These strings match the amended Figure 6.
+    "bnb": {"label": "Knapsack + B&B",     "time": "O(2ⁿ) worst case", "space": "O(2ⁿ) worst case"},
+    # Figure 6 of the manuscript states the hybrid's complexity as
+    # Time O(g·p·n + 2ⁿ) bounded by GA pruning, and Space O(p·n + n) for the
+    # priority queue plus the population. Kept verbatim so a live demo matches
+    # the architecture diagram.
+    # Time O(g·p·n + 2ⁿ): the GA phase plus the branch-and-bound phase. The GA
+    # term is polynomial, so the worst case remains exponential - the GA
+    # improves practical performance, not the asymptotic bound, which is why
+    # "bounded by GA pruning" was dropped.
+    # Space O(p·n + 2ⁿ): the GA population plus the priority queue.
+    "ga":  {"label": "Knapsack + B&B + GA","time": "O(g·p·n + 2ⁿ) worst case","space": "O(p·n + 2ⁿ) worst case"},
+}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Flask app
 # ─────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 @app.errorhandler(400)
 @app.errorhandler(404)
@@ -1375,1437 +1542,12 @@ def json_error(e):
     from flask import jsonify
     return jsonify({"error": str(e)}), e.code
 
-HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>LGU Budget Optimizer</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  /* Ledger-neutral paper, deliberately cool-green rather than cream or blue-white */
-  --bg-base:#EDEFEC;--bg-surface:#FFFFFF;--bg-raised:#F4F5F2;--bg-hover:#E7EAE5;--bg-active:#DCE0D9;
-  --bd-subtle:rgba(23,32,27,.10);--bd-default:rgba(23,32,27,.20);--bd-strong:rgba(23,32,27,.34);
-  --tx-primary:#17201B;--tx-secondary:#4A554D;--tx-muted:#7C877F;--tx-inverse:#FFFFFF;
-  /* Single signal colour: deep pine. Used for the primary action and measured state. */
-  --accent:#0B6B4F;--accent-dim:rgba(11,107,79,.09);--accent-border:rgba(11,107,79,.30);--accent-glow:0 3px 14px rgba(11,107,79,.20);
-  /* Dataset identities — desaturated, carried on thin edge rules not large fills */
-  --pasig:#6A4A9E;--pasig-dim:rgba(106,74,158,.08);--pasig-border:rgba(106,74,158,.30);--pasig-glow:0 3px 14px rgba(106,74,158,.14);
-  --qc:#14607F;--qc-dim:rgba(20,96,127,.08);--qc-border:rgba(20,96,127,.30);--qc-glow:0 3px 14px rgba(20,96,127,.14);
-  --green:#0B6B4F;--green-dim:rgba(11,107,79,.10);--green-border:rgba(11,107,79,.30);
-  --amber:#A15C00;--amber-dim:rgba(161,92,0,.10);--red:#B3261E;--red-dim:rgba(179,38,30,.10);
-  --r-sm:4px;--r-md:7px;--r-lg:10px;--r-xl:14px;--ease:cubic-bezier(.4,0,.2,1);
-  --gutter:34px;   /* width of the numbered step rail */
-}
-html{scroll-behavior:smooth}
-body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-base);color:var(--tx-primary);min-height:100vh;line-height:1.5;-webkit-font-smoothing:antialiased}
-/* All figures use tabular lining numerals so columns align digit-for-digit. */
-.mono,table td,table th,input[type=text],input[type=number]{font-variant-numeric:tabular-nums}
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:#CBD5E1;border-radius:99px}
-::-webkit-scrollbar-thumb:hover{background:#94A3B8}
 
-/* MASTHEAD — quiet by design; the instrument's readings are the hero, not a banner */
-.hero{background:var(--bg-surface);border-bottom:1px solid var(--bd-default);padding:22px 24px 18px}
-.hero-inner{max-width:1100px;margin:0 auto;display:flex;align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap}
-.hero h1{font-size:21px;font-weight:600;letter-spacing:-.25px;color:var(--tx-primary);margin-bottom:3px}
-.hero-sub{font-size:13px;color:var(--tx-secondary);max-width:62ch;line-height:1.45}
-.hero-id{font-size:11.5px;color:var(--tx-muted);text-align:right;line-height:1.7;font-family:'IBM Plex Mono',monospace}
-.hero-id b{display:block;color:var(--tx-secondary);font-weight:500}
-
-/* SKIP LINK — keyboard users reach the controls without tabbing the whole table */
-.skip{position:absolute;left:-9999px;top:0;z-index:100;background:var(--accent);color:#fff;padding:10px 16px;border-radius:0 0 var(--r-md) 0;font-size:13px;font-weight:600}
-.skip:focus{left:0}
-
-/* ACCESSIBILITY FLOOR */
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:2px}
-.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-@media (prefers-reduced-motion:reduce){
-  *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;scroll-behavior:auto !important}
-}
-
-/* NUMBERED STEP RAIL
-   The workflow genuinely is a sequence (data -> budget -> projects -> setup ->
-   run -> read), so the numbering encodes real structure rather than decorating.
-   The rail also gives the eye a fixed left edge to scan down. */
-.step{position:relative;padding-left:var(--gutter);margin-bottom:20px}
-.step::before{content:attr(data-step);position:absolute;left:0;top:1px;width:23px;height:23px;border-radius:50%;
-  background:var(--bg-surface);border:1px solid var(--bd-default);color:var(--tx-secondary);
-  font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center}
-.step::after{content:'';position:absolute;left:11px;top:29px;bottom:-20px;width:1px;background:var(--bd-subtle)}
-.step:last-of-type::after{display:none}
-.step.done::before{background:var(--accent);border-color:var(--accent);color:#fff}
-.step-hdr{margin-bottom:10px;min-height:23px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
-.step-name{font-size:14.5px;font-weight:600;letter-spacing:-.1px;color:var(--tx-primary)}
-.step-note{font-size:12.5px;color:var(--tx-muted)}
-
-/* STICKY ACTION BAR — system status stays visible; the primary action is always
-   reachable (Fitts's law) instead of being buried mid-page. */
-.actionbar{position:sticky;bottom:0;z-index:40;background:rgba(255,255,255,.94);backdrop-filter:blur(10px);
-  border-top:1px solid var(--bd-default);margin-top:26px;padding:11px 20px;box-shadow:0 -3px 16px rgba(23,32,27,.06)}
-.actionbar-inner{max-width:1100px;margin:0 auto;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-.ab-facts{display:flex;gap:18px;flex-wrap:wrap;flex:1;min-width:220px}
-.ab-fact{display:flex;flex-direction:column;gap:1px}
-.ab-fact-l{font-size:10.5px;color:var(--tx-muted);letter-spacing:.01em}
-.ab-fact-v{font-size:13px;font-weight:600;font-family:'IBM Plex Mono',monospace;color:var(--tx-primary)}
-.ab-fact-v.warn{color:var(--amber)}
-.ab-run{padding:11px 22px;font-size:14px;font-weight:600;cursor:pointer;background:var(--accent);border:1px solid var(--accent);
-  border-radius:var(--r-md);color:#fff;transition:background .15s var(--ease);font-family:'IBM Plex Sans',sans-serif;
-  display:flex;align-items:center;gap:8px;white-space:nowrap}
-.ab-run:hover:not(:disabled){background:#095B43}
-.ab-run:disabled{background:var(--bg-active);border-color:var(--bd-default);color:var(--tx-muted);cursor:not-allowed}
-.ab-reason{font-size:12px;color:var(--amber);flex-basis:100%}
-
-/* INLINE MESSAGES — errors are shown in place, never in a modal alert() */
-.msg{display:flex;gap:9px;align-items:flex-start;padding:11px 13px;border-radius:var(--r-md);font-size:13px;line-height:1.5;margin-bottom:14px;border:1px solid}
-.msg-icon{flex-shrink:0;font-weight:700;font-family:'IBM Plex Mono',monospace}
-.msg.err{background:var(--red-dim);border-color:rgba(179,38,30,.3);color:#7E1B15}
-.msg.warn{background:var(--amber-dim);border-color:rgba(161,92,0,.3);color:#6E3F00}
-.msg.info{background:var(--accent-dim);border-color:var(--accent-border);color:#07422F}
-
-/* RESPONSIVE — usable down to a phone viewport */
-@media (max-width:640px){
-  :root{--gutter:26px}
-  .hero-inner{flex-direction:column;align-items:flex-start;gap:10px}
-  .hero-id{text-align:left}
-  .actionbar-inner{gap:10px}
-  .ab-facts{gap:12px;order:1;width:100%}
-  .ab-run{order:2;width:100%;justify-content:center}
-  .ab-fact-l{font-size:10px}
-  .ab-fact-v{font-size:12px}
-  .compare-grid{grid-template-columns:1fr}
-  .stats-bar{grid-template-columns:repeat(2,1fr)}
-  .hist-grid{grid-template-columns:1fr}
-  .wrap{padding:18px 14px 16px}
-}
-
-/* ── Statistical report ─────────────────────────────────────────── */
-.stat-lede{font-size:12.5px;color:var(--tx-secondary);line-height:1.55;margin-bottom:14px;max-width:76ch}
-.stat-block{margin-bottom:16px}
-.stat-block:last-child{margin-bottom:0}
-.sb-title{font-size:12.5px;font-weight:600;color:var(--tx-primary);margin-bottom:7px}
-.stat-table-wrap{overflow-x:auto;border:1px solid var(--bd-subtle);border-radius:var(--r-md)}
-.vd{font-family:'IBM Plex Sans',sans-serif;font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;white-space:nowrap}
-.vd.sig{background:var(--green-dim);color:var(--green);border:1px solid var(--green-border)}
-.vd.ns{background:var(--bg-active);color:var(--tx-secondary);border:1px solid var(--bd-default)}
-.vd.none{background:var(--amber-dim);color:var(--amber);border:1px solid rgba(161,92,0,.3)}
-
-/* EMPTY STATES — an invitation to act, not an apology */
-.empty-state{text-align:center;padding:26px 16px;color:var(--tx-secondary)}
-.empty-state p{font-size:14px;font-weight:600;color:var(--tx-primary);margin-bottom:5px}
-.empty-state .es-sub{font-size:12.5px;font-weight:400;color:var(--tx-muted);max-width:52ch;margin:0 auto;line-height:1.55}
-
-/* DEFINITION AFFORDANCE — recognition over recall for the two timing metrics */
-.deflist{display:flex;gap:20px;flex-wrap:wrap;padding:10px 13px;background:var(--bg-raised);border:1px solid var(--bd-subtle);
-  border-radius:var(--r-md);margin-bottom:14px;font-size:12px;color:var(--tx-secondary);line-height:1.5}
-.deflist div{flex:1;min-width:210px}
-.deflist b{color:var(--tx-primary);font-weight:600}
-
-.wrap{max-width:1100px;margin:0 auto;padding:24px 20px 20px}
-
-/* SECTION LABEL */
-.slabel{display:none}
-.slabel::after{content:'';flex:1;height:1px;background:#E5E7EB}
-
-/* DS SWITCHER */
-.ds-switcher{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}
-@media(max-width:560px){.ds-switcher{grid-template-columns:1fr}}
-.ds-btn{display:flex;align-items:center;gap:14px;padding:16px 18px;background:var(--bg-surface);border:1.5px solid var(--bd-subtle);border-radius:var(--r-lg);cursor:pointer;text-align:left;transition:all .2s var(--ease)}
-.ds-btn:hover{border-color:var(--bd-default);transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,0,0,.06)}
-.ds-btn.active-pasig{border-color:var(--pasig-border);background:linear-gradient(135deg,var(--pasig-dim) 0%,var(--bg-surface) 100%);box-shadow:var(--pasig-glow)}
-.ds-btn.active-qc{border-color:var(--qc-border);background:linear-gradient(135deg,var(--qc-dim) 0%,var(--bg-surface) 100%);box-shadow:var(--qc-glow)}
-.ds-icon{width:44px;height:44px;border-radius:var(--r-md);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;background:var(--bg-raised);border:1px solid var(--bd-subtle);transition:all .2s var(--ease)}
-.ds-btn.active-pasig .ds-icon{background:var(--pasig-dim);border-color:var(--pasig-border)}
-.ds-btn.active-qc .ds-icon{background:var(--qc-dim);border-color:var(--qc-border)}
-.ds-info{flex:1;min-width:0}
-.ds-name{font-size:14px;font-weight:600;color:var(--tx-primary);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.ds-meta{font-size:11px;color:var(--tx-secondary);margin-top:3px}
-.ds-tag{font-size:10px;font-weight:600;padding:2px 8px;border-radius:99px;white-space:nowrap}
-.ds-tag.small{background:#FEF3C7;color:#92400E;border:1px solid #FCD34D}
-.ds-tag.large{background:#D1FAE5;color:#065F46;border:1px solid #6EE7B7}
-.ds-check{width:20px;height:20px;border-radius:50%;border:2px solid var(--bd-default);flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .2s var(--ease)}
-.ds-btn.active-pasig .ds-check{border-color:var(--pasig);background:var(--pasig)}
-.ds-btn.active-qc .ds-check{border-color:var(--qc);background:var(--qc)}
-.ds-check::after{content:'';width:6px;height:6px;border-radius:50%;background:#fff;opacity:0;transform:scale(0);transition:all .15s var(--ease)}
-.ds-btn.active-pasig .ds-check::after,.ds-btn.active-qc .ds-check::after{opacity:1;transform:scale(1)}
-
-/* INFO BAR */
-.ds-infobar{padding:11px 16px;border-radius:var(--r-md);margin-bottom:18px;font-size:12px;line-height:1.6;display:flex;align-items:flex-start;gap:10px;transition:all .25s var(--ease)}
-.ds-infobar.pasig{background:var(--pasig-dim);border:1px solid var(--pasig-border);color:var(--pasig)}
-.ds-infobar.qc{background:var(--qc-dim);border:1px solid var(--qc-border);color:var(--qc)}
-.ds-infobar b{font-weight:600}
-
-/* CARDS */
-.card{background:var(--bg-surface);border:1px solid var(--bd-subtle);border-radius:var(--r-lg);padding:18px;margin-bottom:0;transition:border-color .2s var(--ease)}
-.card:hover{border-color:var(--bd-default)}
-.card-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px}
-.card-title{font-size:13.5px;font-weight:600;letter-spacing:-.1px;color:var(--tx-primary);display:flex;align-items:center;gap:7px}
-.ctdot{display:none}
-.card-meta{font-size:11px;color:var(--tx-muted)}
-
-/* BUDGET */
-.budget-block{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-.budget-label{font-size:13px;color:var(--tx-secondary);min-width:100px;font-weight:500}
-.budget-slider-wrap{flex:1;min-width:200px}
-input[type=range]{width:100%;height:4px;-webkit-appearance:none;appearance:none;background:var(--bg-raised);border-radius:99px;outline:none;cursor:pointer;border:1px solid var(--bd-subtle)}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-dim),var(--accent-glow);cursor:pointer;transition:transform .15s var(--ease)}
-input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.2)}
-input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:var(--accent);border:none;cursor:pointer}
-.budget-input-wrap{display:flex;align-items:center;gap:4px;min-width:200px;justify-content:flex-end;background:var(--bg-raised);border:1px solid var(--bd-subtle);border-radius:var(--r-md);padding:6px 12px;transition:all .15s var(--ease)}
-.budget-input-wrap:focus-within{border-color:var(--accent-border);background:var(--bg-active);box-shadow:0 0 0 3px var(--accent-dim)}
-.budget-peso{font-size:22px;font-weight:700;font-family:'IBM Plex Mono',monospace;color:var(--accent);letter-spacing:-.5px}
-#budgetInput{flex:1;min-width:0;border:none;outline:none;background:transparent;font-size:22px;font-weight:700;font-family:'IBM Plex Mono',monospace;color:var(--accent);letter-spacing:-.5px;text-align:right;padding:0}
-#budgetInput::placeholder{color:var(--tx-muted)}
-
-/* TOOLBAR */
-.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
-.search-wrap{flex:1;min-width:200px;position:relative}
-.search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--tx-muted);font-size:13px;pointer-events:none}
-.search-wrap input[type=text]{width:100%;padding:8px 12px 8px 30px;background:var(--bg-raised);border:1px solid var(--bd-subtle);border-radius:var(--r-md);color:var(--tx-primary);font-size:13px;font-family:'IBM Plex Sans',sans-serif;outline:none;transition:all .15s var(--ease)}
-.search-wrap input[type=text]::placeholder{color:var(--tx-muted)}
-.search-wrap input[type=text]:focus{border-color:var(--accent-border);background:var(--bg-active);box-shadow:0 0 0 3px var(--accent-dim)}
-.filter-btn{padding:6px 13px;border-radius:var(--r-md);font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--bd-subtle);color:var(--tx-secondary);background:var(--bg-raised);transition:all .15s var(--ease);white-space:nowrap;font-family:'IBM Plex Sans',sans-serif}
-.filter-btn:hover{border-color:var(--bd-default);color:var(--tx-primary);background:var(--bg-active)}
-.filter-btn.on{border-color:var(--accent-border);color:var(--accent);background:var(--accent-dim)}
-
-/* TABLE */
-.tbl-wrap{max-height:380px;overflow-y:auto;border:1px solid var(--bd-subtle);border-radius:var(--r-lg);background:#fff}
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-thead th{position:sticky;top:0;z-index:2;background:var(--bg-raised);padding:9px 12px;text-align:left;color:var(--tx-secondary);font-weight:600;font-size:11.5px;letter-spacing:0;border-bottom:1px solid var(--bd-default)}
-tbody tr{transition:background .1s var(--ease);border-bottom:1px solid var(--bd-subtle)}
-tbody tr:last-child{border-bottom:none}
-tbody tr:hover{background:var(--bg-hover)}
-td{padding:8px 12px;vertical-align:middle}
-.chk{width:15px;height:15px;cursor:pointer;accent-color:var(--accent)}
-.s-badge{font-size:10px;font-weight:600;padding:2px 8px;border-radius:99px;white-space:nowrap;display:inline-block}
-.s-Healthcare{background:#FEE2E2;color:#B91C1C;border:1px solid #FCA5A5}
-.s-Infrastructure{background:#E0F2FE;color:#0369A1;border:1px solid #7DD3FC}
-.s-Education{background:#DCFCE7;color:#15803D;border:1px solid #86EFAC}
-.s-Social-Services{background:#EDE9FE;color:#6D28D9;border:1px solid #C4B5FD}
-.s-Environment{background:#D1FAE5;color:#065F46;border:1px solid #6EE7B7}
-.s-Public-Safety{background:#FFF7ED;color:#C2410C;border:1px solid #FDC187}
-.s-General-Government{background:#F3F4F6;color:#4B5563;border:1px solid #D1D5DB}
-.cost-col{text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12px;white-space:nowrap;color:var(--tx-secondary)}
-.benefit-col{text-align:center}
-.b-pill{display:inline-block;font-size:11px;font-weight:700;font-family:'IBM Plex Mono',monospace;width:32px;height:22px;line-height:22px;border-radius:6px;text-align:center;color:#fff}
-.sel-count{font-size:12px;color:var(--tx-secondary);margin-top:10px;display:flex;align-items:center;gap:6px}
-.sel-pill{background:var(--accent-dim);color:var(--accent);border:1px solid var(--accent-border);border-radius:99px;padding:1px 8px;font-size:11px;font-weight:600}
-
-/* RUN BTN */
-/* ── Run setup ──────────────────────────────────────────────────── */
-.setup-grid{display:grid;grid-template-columns:1fr auto;gap:22px;align-items:start}
-@media (max-width:720px){.setup-grid{grid-template-columns:1fr}}
-.setup-field{min-width:0}
-.setup-lbl{font-size:12.5px;font-weight:600;color:var(--tx-secondary);margin-bottom:8px}
-.setup-hint{font-size:11.5px;color:var(--tx-muted);margin-top:7px;max-width:34ch}
-.trials-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.trials-input{width:64px;padding:7px 9px;font-size:13.5px;font-weight:600;text-align:center;border:1px solid var(--bd-default);border-radius:var(--r-sm);background:var(--bg-surface);color:var(--tx-primary);font-family:'IBM Plex Mono',monospace}
-.trials-input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
-.trials-presets{display:flex;gap:5px}
-.tpreset{padding:7px 12px;font-size:12.5px;font-weight:500;cursor:pointer;background:var(--bg-raised);border:1px solid var(--bd-default);border-radius:var(--r-sm);color:var(--tx-secondary);transition:all .15s var(--ease);font-family:'IBM Plex Sans',sans-serif}
-.tpreset:hover{background:var(--accent-dim);border-color:var(--accent-border);color:var(--accent)}
-/* ── History panel ──────────────────────────────────────────────── */
-.hist-actions{display:flex;gap:8px;margin-left:auto}
-.hist-btn{padding:8px 14px;font-size:12.5px;font-weight:600;cursor:pointer;border-radius:var(--r-sm);border:1px solid var(--bd-default);background:var(--bg-raised);color:var(--tx-secondary);transition:all .15s var(--ease);font-family:'IBM Plex Sans',sans-serif}
-.hist-btn:hover{background:var(--bg-hover);border-color:var(--bd-strong)}
-.hist-btn.export{background:linear-gradient(135deg,#16A34A 0%,#12813B 100%);border:none;color:#fff;box-shadow:0 3px 12px rgba(22,163,74,.28)}
-.hist-btn.export:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(22,163,74,.38)}
-.hist-btn.danger:hover{background:var(--red-dim);border-color:var(--red);color:var(--red)}
-.hist-card{background:var(--bg-raised);border:1px solid var(--bd-subtle);border-radius:var(--r-md);padding:12px 14px;cursor:pointer;transition:all .15s var(--ease)}
-.hist-card:hover{border-color:var(--bd-strong);transform:translateY(-1px)}
-.hist-card.done{border-color:var(--green-border);background:var(--green-dim)}
-.hist-card.on{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
-/* per-run detail table */
-.hist-detail{margin-top:14px;border-top:1px solid var(--bd-subtle);padding-top:14px}
-.hist-detail-hdr{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
-.hd-title{font-size:13px;font-weight:700;color:var(--tx-primary)}
-.hd-sub{font-size:11.5px;color:var(--tx-muted)}
-.hist-table-wrap{max-height:380px;overflow:auto;border:1px solid var(--bd-subtle);border-radius:var(--r-md)}
-.hist-table{width:100%;border-collapse:collapse;font-size:12px;font-family:'IBM Plex Mono',monospace}
-.hist-table th{position:sticky;top:0;z-index:2;background:var(--bg-active);color:var(--tx-secondary);font-family:'IBM Plex Sans',sans-serif;font-size:11px;font-weight:700;text-align:right;padding:9px 11px;white-space:nowrap;border-bottom:1px solid var(--bd-default)}
-.hist-table th:first-child{text-align:left}
-.hist-table td{padding:7px 11px;text-align:right;color:var(--tx-primary);border-bottom:1px solid var(--bd-subtle);white-space:nowrap}
-.hist-table tbody tr:hover{background:var(--bg-hover)}
-.hist-table .hr-idx{text-align:left;font-family:'IBM Plex Sans',sans-serif;font-weight:600;color:var(--tx-secondary)}
-.hist-table .hr-dim{color:var(--tx-muted)}
-.hist-table .hr-time{color:var(--tx-muted);font-size:11px}
-.hist-table tfoot td{position:sticky;bottom:0;background:var(--accent-dim);font-weight:700;border-top:1px solid var(--accent-border);border-bottom:none}
-.hist-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}
-.hist-algo{font-size:12.5px;font-weight:700;color:var(--tx-primary);margin-bottom:2px}
-.hist-ds{font-size:11px;color:var(--tx-muted);margin-bottom:9px}
-.hist-count{font-size:20px;font-weight:700;font-family:'IBM Plex Mono',monospace;color:var(--tx-primary)}
-.hist-count.done{color:var(--green)}
-.hist-of{font-size:12px;color:var(--tx-muted);font-weight:500}
-.hist-bar{height:5px;background:var(--bg-active);border-radius:3px;overflow:hidden;margin-top:8px}
-.hist-bar-fill{height:100%;background:var(--accent);border-radius:3px;transition:width .4s var(--ease)}
-.hist-bar-fill.done{background:var(--green)}
-.hist-empty{font-size:13px;color:var(--tx-muted);text-align:center;padding:22px 10px;line-height:1.6}
-.run-btn{width:100%;padding:14px;font-size:15px;font-weight:700;cursor:pointer;background:linear-gradient(135deg,#4F6EF7 0%,#3B55E0 100%);border:none;border-radius:var(--r-lg);color:#fff;letter-spacing:.02em;transition:all .2s var(--ease);margin-bottom:16px;display:flex;align-items:center;justify-content:center;gap:8px;box-shadow:0 4px 20px rgba(79,110,247,.28);font-family:'IBM Plex Sans',sans-serif}
-.run-btn:hover{transform:translateY(-2px);box-shadow:0 8px 30px rgba(79,110,247,.4)}
-.run-btn:active{transform:translateY(0)}
-.run-btn:disabled{opacity:.6;cursor:not-allowed;transform:none;box-shadow:none}
-
-/* PROGRESS BAR */
-.progress-wrap{display:none;margin-bottom:16px}
-.progress-bar-bg{background:var(--bg-raised);border-radius:99px;height:8px;overflow:hidden;border:1px solid var(--bd-subtle)}
-.progress-bar-fill{height:8px;border-radius:99px;background:linear-gradient(90deg,#4F6EF7,#7C3AED);transition:width .3s var(--ease);width:0%}
-.progress-label{font-size:12px;color:var(--tx-secondary);margin-top:6px;text-align:center}
-
-/* RESULTS */
-.compare-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:16px}
-@media(max-width:640px){.compare-grid{grid-template-columns:1fr}}
-
-/* ALGO SELECTOR */
-.algo-select{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
-.algo-chk-label{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:500;color:var(--tx-secondary);cursor:pointer;padding:9px 14px;border:1.5px solid var(--bd-subtle);border-radius:var(--r-md);background:var(--bg-surface);transition:all .15s var(--ease);flex:1;min-width:150px;justify-content:center}
-.algo-chk-label:hover{border-color:var(--bd-default);color:var(--tx-primary)}
-.algo-chk-label input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px;cursor:pointer}
-.algo-chk-label.checked{border-color:var(--accent-border);color:var(--accent);background:var(--accent-dim);font-weight:600}
-@media(max-width:560px){.algo-select{flex-direction:column}.algo-chk-label{min-width:0}}
-.ccard{background:var(--bg-raised);border:1px solid var(--bd-subtle);border-radius:var(--r-lg);padding:16px;position:relative;overflow:hidden;transition:all .2s var(--ease)}
-.ccard::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:transparent;transition:background .2s var(--ease)}
-.ccard.best{border-color:var(--green-border);background:linear-gradient(180deg,rgba(22,163,74,.06) 0%,var(--bg-surface) 60%);box-shadow:0 4px 20px rgba(22,163,74,.12)}
-.ccard.best::before{background:linear-gradient(90deg,var(--green),transparent)}
-.best-tag{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;letter-spacing:0;background:var(--green-dim);color:var(--green);border:1px solid var(--green-border);padding:2px 8px;border-radius:99px;margin-bottom:10px}
-.ccard-eye{height:22px;margin-bottom:10px}
-.ccard-title{font-size:12px;font-weight:600;color:var(--tx-secondary);margin-bottom:8px}
-.ccard-big{font-size:30px;font-weight:700;font-family:'IBM Plex Mono',monospace;color:var(--tx-primary);letter-spacing:-1px;line-height:1}
-.ccard-sub{font-size:11px;color:var(--tx-muted);margin-top:4px}
-.bar-t{background:var(--bg-hover);border-radius:99px;height:5px;width:100%;margin-top:12px;overflow:hidden}
-.bar-f{height:5px;border-radius:99px;transition:width .6s var(--ease)}
-.ccard-div{height:1px;background:var(--bd-subtle);margin:12px 0}
-.ccard-row{display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px}
-.ccard-row .lbl{color:var(--tx-muted)}
-.ccard-row .val{color:var(--tx-secondary);font-family:'IBM Plex Mono',monospace;font-size:11px}
-.ccard-row .val.hl{color:var(--accent);font-weight:600}
-.ccard-row .val.hl-green{color:var(--green);font-weight:600}
-.ccard-row.node-row{cursor:pointer;user-select:none;border-radius:4px;margin:0 -4px 5px;padding:1px 4px;transition:background .15s var(--ease)}
-.ccard-row.node-row:hover{background:var(--bg-hover)}
-.ccard-row.node-row .lbl{display:inline-flex;align-items:center;gap:5px}
-.ccard-row.node-row .nt-caret{display:inline-block;transition:transform .15s var(--ease);font-size:8px;line-height:1;color:var(--tx-muted)}
-.ccard-row.node-row.open .nt-caret{transform:rotate(90deg)}
-.node-detail{margin-bottom:1px}
-
-/* BANNER */
-.banner{display:flex;align-items:center;gap:10px;padding:11px 16px;border-radius:var(--r-md);font-size:13px;font-weight:500;margin-bottom:16px}
-.banner.ok{background:var(--green-dim);border:1px solid var(--green-border);color:var(--green)}
-.banner.warn{background:var(--amber-dim);border:1px solid rgba(180,83,9,.3);color:var(--amber)}
-
-/* STATS */
-.stats-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px}
-.stat{background:var(--bg-base);border:1px solid var(--bd-subtle);border-radius:var(--r-lg);padding:14px 16px}
-.stat-l{font-size:11px;font-weight:500;letter-spacing:0;color:var(--tx-muted);margin-bottom:6px}
-.stat-v{font-size:20px;font-weight:700;font-family:'IBM Plex Mono',monospace;color:var(--tx-primary);letter-spacing:-.5px}
-.stat-v.acc{color:var(--accent)}
-.stat-s{font-size:11px;color:var(--tx-muted);margin-top:3px}
-
-/* ALGO TABS */
-.algo-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;background:var(--bg-base);border:1px solid var(--bd-subtle);border-radius:var(--r-lg);padding:5px}
-.algo-tab{flex:1;padding:8px 16px;border-radius:var(--r-md);font-size:13px;font-weight:600;cursor:pointer;border:none;color:var(--tx-secondary);background:transparent;transition:all .15s var(--ease);text-align:center;font-family:'IBM Plex Sans',sans-serif;white-space:nowrap}
-.algo-tab:hover{color:var(--tx-primary);background:var(--bg-hover)}
-.algo-tab.on{color:#fff;background:var(--accent);box-shadow:0 2px 10px rgba(79,110,247,.25)}
-
-/* RESULT LIST */
-.res-list{display:flex;flex-direction:column;gap:4px;max-height:340px;overflow-y:auto;border:1px solid var(--bd-subtle);border-radius:var(--r-md);padding:8px}
-.res-chip{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--r-md);font-size:12px;transition:all .12s var(--ease);border:1px solid transparent}
-.res-chip.sel{background:var(--accent-dim);border-color:var(--accent-border)}
-.res-chip.sel:hover{background:rgba(79,110,247,.15)}
-.res-chip.rej{background:var(--bg-raised);border-color:var(--bd-subtle);opacity:.45}
-.res-chip.rej .res-name{text-decoration:line-through;color:var(--tx-muted)}
-.res-name{flex:1;color:var(--tx-primary);line-height:1.3}
-.res-cost{min-width:88px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--tx-secondary)}
-.res-score{min-width:50px;text-align:right;font-weight:700;font-size:12px;color:var(--accent)}
-.res-chip.rej .res-score{color:var(--tx-muted)}
-
-/* MISC */
-.empty{text-align:center;padding:2.5rem;color:var(--tx-muted);font-size:14px}
-.spinner{display:inline-block;width:16px;height:16px;border:2.5px solid rgba(79,110,247,.25);border-top-color:#4F6EF7;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:8px}
-@keyframes spin{to{transform:rotate(360deg)}}
-.footer{text-align:center;font-size:11px;color:var(--tx-muted);padding-top:12px;border-top:1px solid var(--bd-subtle)}
-@keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-.fade-in{animation:fadeUp .3s var(--ease) both}
-.pool-meta{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--tx-muted);background:var(--bg-raised);border:1px solid var(--bd-subtle);border-radius:99px;padding:2px 10px}
-.dot{width:5px;height:5px;border-radius:50%;background:var(--accent);display:inline-block}
-.pagination{display:flex;align-items:center;justify-content:space-between;margin-top:10px;flex-wrap:wrap;gap:8px}
-.page-info{font-size:12px;color:var(--tx-muted)}
-.page-btns{display:flex;gap:6px}
-.page-btn{padding:4px 12px;border-radius:var(--r-md);font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--bd-subtle);color:var(--tx-secondary);background:var(--bg-raised);font-family:'IBM Plex Sans',sans-serif;transition:all .15s var(--ease)}
-.page-btn:hover:not(:disabled){border-color:var(--accent-border);color:var(--accent)}
-.page-btn:disabled{opacity:.4;cursor:not-allowed}
-.page-btn.active{border-color:var(--accent-border);color:var(--accent);background:var(--accent-dim)}
-</style>
-</head>
-<body>
-
-<a class="skip" href="#setup">Skip to run setup</a>
-
-<div class="hero">
-  <div class="hero-inner">
-    <div>
-      <h1>LGU Budget Optimizer</h1>
-      <p class="hero-sub">Selects the combination of local government projects that maximises total social benefit
-      within a fixed budget, and measures how three knapsack algorithms perform on the same problem.</p>
-    </div>
-    <div class="hero-id">
-      <b>Thesis Group 2 — BSCS 3-1N</b>
-      Polytechnic University of the Philippines
-    </div>
-  </div>
-</div>
-
-<div class="wrap">
-
-  <div id="globalMsg" role="alert" aria-live="assertive"></div>
-
-  <!-- STEP 1 ─ Dataset -->
-  <section class="step done" data-step="1" id="stepDataset">
-    <div class="step-hdr">
-      <span class="step-name">Choose a dataset</span>
-      <span class="step-note">Determines the problem size the algorithms are tested against</span>
-    </div>
-    <div class="ds-switcher">
-      <button class="ds-btn active-pasig" id="btnPasig" onclick="switchDs('pasig')" aria-pressed="true">
-        <div class="ds-info">
-          <div class="ds-name">Pasig City <span class="ds-tag small">Small</span></div>
-          <div class="ds-meta" id="pasigMeta">Loading…</div>
-        </div>
-        <div class="ds-check"></div>
-      </button>
-      <button class="ds-btn" id="btnQC" onclick="switchDs('qc')" aria-pressed="false">
-        <div class="ds-info">
-          <div class="ds-name">Quezon City <span class="ds-tag large">Large</span></div>
-          <div class="ds-meta" id="qcMeta">Loading…</div>
-        </div>
-        <div class="ds-check"></div>
-      </button>
-    </div>
-    <div class="ds-infobar pasig" id="infoBar">
-      <span id="infoText"><b>Pasig City APP FY 2025 (General Fund)</b> — Source: City Government of Pasig, LGU Transparency Portal. Used as the <b>small dataset</b> to establish a standard of optimality and verify algorithm accuracy.</span>
-    </div>
-  </section>
-
-  <!-- STEP 2 ─ Budget -->
-  <section class="step done" data-step="2" id="stepBudget">
-    <div class="step-hdr">
-      <span class="step-name">Set the budget ceiling</span>
-      <span class="step-note">The knapsack capacity — shared across both datasets so results stay comparable</span>
-    </div>
-    <div class="card">
-      <div class="budget-block">
-        <label class="budget-label" for="budgetInput">Total project budget</label>
-        <div class="budget-slider-wrap">
-          <input type="range" id="budgetSlider" min="0" max="50000000000" step="100000000" value="5000000000"
-                 aria-label="Budget ceiling slider" oninput="updateBudget(this.value, 'slider')">
-        </div>
-        <div class="budget-input-wrap">
-          <span class="budget-peso">₱</span>
-          <input type="text" inputmode="numeric" id="budgetInput" value="5,000,000,000"
-                 oninput="updateBudget(this.value, 'input')"
-                 onblur="normalizeBudgetInput()"
-                 aria-label="Total project budget amount">
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- STEP 3 ─ Projects -->
-  <section class="step" data-step="3" id="stepProjects">
-    <div class="step-hdr">
-      <span class="step-name">Select candidate projects</span>
-      <span class="step-note">These become the items the algorithms choose between</span>
-    </div>
-    <div class="card">
-    <div class="card-hdr">
-      <div class="card-title">
-        Project pool
-        <span class="pool-meta"><span class="dot"></span><span id="poolLabel">Loading…</span></span>
-      </div>
-      <div class="card-meta"><span id="totalCount">0</span> projects &nbsp;·&nbsp; ₱<span id="totalBudgetLbl">0</span> total</div>
-    </div>
-    <div class="toolbar">
-      <div class="search-wrap">
-        <span class="search-icon">⌕</span>
-        <input type="text" id="searchBox" placeholder="Search projects or office…" oninput="filterProjects()">
-      </div>
-      <button class="filter-btn on" data-sector="All" onclick="setSector(this)">All</button>
-      <button class="filter-btn" data-sector="Healthcare" onclick="setSector(this)">Healthcare</button>
-      <button class="filter-btn" data-sector="Infrastructure" onclick="setSector(this)">Infrastructure</button>
-      <button class="filter-btn" data-sector="Education" onclick="setSector(this)">Education</button>
-      <button class="filter-btn" data-sector="Social Services" onclick="setSector(this)">Social Services</button>
-      <button class="filter-btn" data-sector="Environment" onclick="setSector(this)">Environment</button>
-      <button class="filter-btn" data-sector="Public Safety" onclick="setSector(this)">Public Safety</button>
-    </div>
-    <div class="tbl-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th style="width:36px"><input type="checkbox" class="chk" id="chkAll" onchange="toggleAll(this.checked)"></th>
-            <th>Project / program</th>
-            <th>Sector</th>
-            <th>Office</th>
-            <th style="text-align:right">Cost (₱)</th>
-            <th style="text-align:center">Benefit</th>
-          </tr>
-        </thead>
-        <tbody id="projTbody"></tbody>
-      </table>
-    </div>
-    <div class="pagination">
-      <div class="page-info" id="pageInfo">Showing 0–0 of 0</div>
-      <div class="page-btns" id="pageBtns"></div>
-    </div>
-    <div class="sel-count">
-      <span class="sel-pill" id="selPill">0 selected</span>
-      <span id="selCost">₱0 total cost</span>
-    </div>
-    </div>
-  </section>
-
-  <!-- STEP 4 ─ Run setup -->
-  <section class="step" data-step="4" id="setup">
-    <div class="step-hdr">
-      <span class="step-name">Configure the run</span>
-      <span class="step-note">Every run is recorded; the last 30 per dataset and algorithm are kept</span>
-    </div>
-    <div class="card">
-      <div class="setup-grid">
-        <div class="setup-field">
-          <div class="setup-lbl" id="algoLbl">Algorithms</div>
-          <div class="algo-select" id="algoSelect" role="group" aria-labelledby="algoLbl">
-            <label class="algo-chk-label checked" id="lbl-dp">
-              <input type="checkbox" checked onchange="toggleAlgo('dp',this)"> Knapsack (DP)
-            </label>
-            <label class="algo-chk-label checked" id="lbl-bnb">
-              <input type="checkbox" checked onchange="toggleAlgo('bnb',this)"> Knapsack + B&amp;B
-            </label>
-            <label class="algo-chk-label checked" id="lbl-ga">
-              <input type="checkbox" checked onchange="toggleAlgo('ga',this)"> Knapsack + B&amp;B + GA
-            </label>
-          </div>
-        </div>
-        <div class="setup-field">
-          <label class="setup-lbl" for="trialsInput">Independent runs per algorithm</label>
-          <div class="trials-row">
-            <input type="number" id="trialsInput" class="trials-input" min="1" max="30" value="1"
-                   oninput="updateActionBar()">
-            <div class="trials-presets">
-              <button class="tpreset" onclick="setTrials(1)">1</button>
-              <button class="tpreset" onclick="setTrials(10)">10</button>
-              <button class="tpreset" onclick="setTrials(30)">30</button>
-            </div>
-          </div>
-          <div class="setup-hint">The study specifies 30 independent runs per algorithm, per dataset.</div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- STEP 5 ─ Results -->
-  <section class="step" data-step="5" id="stepResults">
-    <div class="step-hdr">
-      <span class="step-name">Compare the results</span>
-      <span class="step-note">Optimality measures for each algorithm on this problem</span>
-    </div>
-    <div class="progress-wrap" id="progressWrap">
-      <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressFill"></div></div>
-      <div class="progress-label" id="progressLabel" role="status" aria-live="polite">Initialising…</div>
-    </div>
-    <div id="results">
-      <div class="card">
-        <div class="empty-state">
-          <p>No results yet.</p>
-          <p class="es-sub">Choose your projects and algorithms, then run. Each algorithm's runtime,
-          execution time and pruning rate will be compared here.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- STEP 6 ─ History -->
-  <section class="step" data-step="6" id="stepHistory">
-    <div class="step-hdr">
-      <span class="step-name">Review and export run history</span>
-      <span class="step-note">Held in memory only — export before closing the tool</span>
-    </div>
-    <div id="historyPanel"></div>
-  </section>
-
-  <!-- STEP 7 ─ Statistical report -->
-  <section class="step" data-step="7" id="stepStats">
-    <div class="step-hdr">
-      <span class="step-name">Statistical report</span>
-      <span class="step-note">Efficiency ratios and t-tests over the recorded runs</span>
-    </div>
-    <div id="statsPanel"></div>
-  </section>
-
-  <div class="footer" id="footerTxt">
-    Pasig City Annual Procurement Plan FY 2025 (General Fund).
-    Algorithms: dynamic programming; branch and bound (Land &amp; Doig, 1960);
-    genetic algorithm (Holland's schema theorem).
-  </div>
-</div>
-
-<!-- Persistent status + primary action -->
-<div class="actionbar">
-  <div class="actionbar-inner">
-    <div class="ab-facts">
-      <div class="ab-fact"><span class="ab-fact-l">Dataset</span><span class="ab-fact-v" id="abDs">Pasig</span></div>
-      <div class="ab-fact"><span class="ab-fact-l">Budget</span><span class="ab-fact-v" id="abBudget">₱5.0B</span></div>
-      <div class="ab-fact"><span class="ab-fact-l">Projects selected</span><span class="ab-fact-v" id="abSel">0</span></div>
-      <div class="ab-fact"><span class="ab-fact-l">Algorithms</span><span class="ab-fact-v" id="abAlgos">3</span></div>
-      <div class="ab-fact"><span class="ab-fact-l">Runs each</span><span class="ab-fact-v" id="abTrials">1</span></div>
-    </div>
-    <button class="ab-run" id="runBtn" onclick="runAlgos()">Run algorithms</button>
-    <div class="ab-reason" id="abReason"></div>
-  </div>
-</div>
-
-<script>
-// ── State ──────────────────────────────────────────────────────────────────
-let DS       = 'pasig';
-let PROJECTS = [];   // full dataset for current DS
-let FILTERED = [];   // after sector + search filter
-let CHECKED  = new Set();
-let BUDGET   = 5_000_000_000;
-let SECTOR   = 'All';
-let PAGE     = 0;
-const PAGE_SIZE = 50;
-
-let currentTab  = 2;
-const _expandedNodes = new Set();
-let activeAlgos = {dp: true, bnb: true, ga: true};
-
-function toggleAlgo(name, el) {
-  // Prevent unchecking the last remaining algorithm
-  const others = Object.keys(activeAlgos).filter(k => k !== name);
-  const anyOtherActive = others.some(k => activeAlgos[k]);
-  if (!el.checked && !anyOtherActive) {
-    el.checked = true;
-    return;
-  }
-  activeAlgos[name] = el.checked;
-  document.getElementById('lbl-'+name).classList.toggle('checked', el.checked);
-  updateActionBar();
-}
-
-// ── Init ───────────────────────────────────────────────────────────────────
-async function init() {
-  await loadDs('pasig');
-  updateMeta();
-  updateActionBar();
-}
-
-async function loadDs(ds) {
-  DS = ds;
-  const resp = await fetch(`/api/projects?ds=${ds}`);
-  const data = await resp.json();
-  PROJECTS = data.projects;
-  CHECKED.clear();
-  SECTOR = 'All';
-  PAGE   = 0;
-  document.getElementById('searchBox').value = '';
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.toggle('on', b.dataset.sector === 'All'));
-
-  // Update switcher
-  document.getElementById('btnPasig').className = 'ds-btn' + (ds==='pasig' ? ' active-pasig' : '');
-  document.getElementById('btnQC').className    = 'ds-btn' + (ds==='qc'    ? ' active-qc'    : '');
-  const bar = document.getElementById('infoBar');
-  bar.className = 'ds-infobar ' + ds;
-  const info = {
-    pasig: '<b>Pasig City APP FY 2025 (General Fund)</b> — Source: City Government of Pasig, LGU Transparency Portal. Used as the <b>small dataset</b> to establish a standard of optimality and verify algorithm accuracy.',
-    qc:    '<b>Quezon City APP FY 2025 (4th Quarter)</b> — Source: QC Bids and Awards Committee, LGU Transparency Portal. Used as the <b>large dataset</b> to stress-test scalability and efficiency of the hybrid algorithm.',
-  };
-  document.getElementById('infoText').innerHTML = info[ds];
-  document.getElementById('footerTxt').textContent = ds==='pasig'
-    ? 'Pasig City · Annual Procurement Plan FY 2025 (General Fund) | Knapsack DP · Branch & Bound · Genetic Algorithm'
-    : 'Quezon City · Annual Procurement Plan FY 2025 (4th Quarter) | Knapsack DP · Branch & Bound · Genetic Algorithm';
-
-  filterProjects();
-  preselectTop();
-  document.getElementById('results').innerHTML = '';
-}
-
-function switchDs(ds) {
-  if (ds === DS) return;
-  loadDs(ds);
-  const bp = document.getElementById('btnPasig');
-  const bq = document.getElementById('btnQC');
-  if (bp) bp.setAttribute('aria-pressed', ds === 'pasig');
-  if (bq) bq.setAttribute('aria-pressed', ds === 'qc');
-}
-
-function updateMeta() {
-  fetch('/api/meta').then(r=>r.json()).then(d=>{
-    document.getElementById('pasigMeta').textContent =
-      `APP FY 2025 · General Fund · ${d.pasig.count.toLocaleString()} projects`;
-    document.getElementById('qcMeta').textContent =
-      `APP FY 2025 · 4th Quarter · ${d.qc.count.toLocaleString()} projects`;
-  });
-}
-
-// ── Budget ─────────────────────────────────────────────────────────────────
-const BUDGET_MAX = 50000000000;
-
-function updateBudget(v, source) {
-  let n;
-  if (source === 'input') {
-    // Strip everything except digits (allow the user to type commas freely)
-    n = parseInt(String(v).replace(/[^\d]/g, ''), 10);
-    if (isNaN(n)) n = 0;
-  } else {
-    n = parseInt(v, 10);
-    if (isNaN(n)) n = 0;
-  }
-  // Clamp to [0, BUDGET_MAX]
-  if (n < 0) n = 0;
-  if (n > BUDGET_MAX) n = BUDGET_MAX;
-  BUDGET = n;
-
-  // Sync the slider (always reflects the clamped value)
-  document.getElementById('budgetSlider').value = n;
-
-  // Sync the text input. While the user is actively typing in it, don't
-  // fight their cursor by reformatting mid-edit; only push the formatted
-  // value when the change came from the slider.
-  if (source !== 'input') {
-    document.getElementById('budgetInput').value = n.toLocaleString();
-  }
-  updateActionBar();
-}
-
-function normalizeBudgetInput() {
-  // On blur, snap the text field to the clean formatted, clamped value.
-  document.getElementById('budgetInput').value = BUDGET.toLocaleString();
-}
-
-function fmt(n) {
-  return '₱' + Math.round(n).toLocaleString();
-}
-function fmtB(n) {
-  if (n >= 1e9) return (n/1e9).toFixed(2)+'B';
-  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
-  return Math.round(n).toLocaleString();
-}
-
-// ── Filter + render ────────────────────────────────────────────────────────
-function setSector(btn) {
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('on'));
-  btn.classList.add('on');
-  SECTOR = btn.dataset.sector;
-  PAGE = 0;
-  filterProjects();
-}
-
-function filterProjects() {
-  const q = document.getElementById('searchBox').value.toLowerCase();
-  FILTERED = PROJECTS.filter(p => {
-    if (SECTOR !== 'All' && p.sector !== SECTOR) return false;
-    if (q && !p.name.toLowerCase().includes(q) && !p.pmo.toLowerCase().includes(q)) return false;
-    return true;
-  });
-  PAGE = 0;
-  renderTable();
-}
-
-function renderTable() {
-  const start = PAGE * PAGE_SIZE;
-  const end   = Math.min(start + PAGE_SIZE, FILTERED.length);
-  const page_items = FILTERED.slice(start, end);
-
-  const tbody = document.getElementById('projTbody');
-  if (!FILTERED.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">No projects match the filter.</td></tr>';
-    renderPagination();
-    updateSelCount();
-    return;
-  }
-
-  tbody.innerHTML = page_items.map((p, li) => {
-    const pi = p._idx;  // index in PROJECTS
-    const chk = CHECKED.has(pi);
-    return `<tr>
-      <td><input type="checkbox" class="chk" ${chk?'checked':''} onchange="toggleCheck(${pi},this.checked)"></td>
-      <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(p.name)}">${escHtml(p.name)}</td>
-      <td><span class="s-badge s-${p.sector.replace(/ /g,'-')}">${p.sector}</span></td>
-      <td style="font-size:11px;color:var(--tx-secondary);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(p.pmo)}</td>
-      <td class="cost-col">${fmtB(p.cost)}</td>
-      <td class="benefit-col"><span class="b-pill" style="background:${bcolor(p.benefit)}">${p.benefit.toFixed(1)}</span></td>
-    </tr>`;
-  }).join('');
-
-  // Update pool stats
-  document.getElementById('totalCount').textContent  = PROJECTS.length.toLocaleString();
-  document.getElementById('poolLabel').textContent   = DS==='pasig'
-    ? 'Pasig City APP FY 2025' : 'Quezon City APP FY 2025';
-  const tot = PROJECTS.reduce((s,p)=>s+p.cost,0);
-  document.getElementById('totalBudgetLbl').textContent = fmtB(tot);
-
-  renderPagination();
-  updateSelCount();
-  syncChkAll();
-}
-
-function renderPagination() {
-  const total_pages = Math.ceil(FILTERED.length / PAGE_SIZE);
-  const start = PAGE * PAGE_SIZE + 1;
-  const end   = Math.min((PAGE+1)*PAGE_SIZE, FILTERED.length);
-  document.getElementById('pageInfo').textContent = `Showing ${start.toLocaleString()}–${end.toLocaleString()} of ${FILTERED.length.toLocaleString()}`;
-
-  const cont = document.getElementById('pageBtns');
-  if (total_pages <= 1) { cont.innerHTML=''; return; }
-
-  let btns = `<button class="page-btn" onclick="goPage(${PAGE-1})" ${PAGE===0?'disabled':''}>←</button>`;
-  // Show at most 7 page buttons around current
-  const lo = Math.max(0, PAGE-3), hi = Math.min(total_pages-1, PAGE+3);
-  if (lo > 0) btns += `<button class="page-btn" onclick="goPage(0)">1</button>${lo>1?'<span style="color:var(--tx-muted);padding:0 4px">…</span>':''}`;
-  for (let i=lo; i<=hi; i++) btns += `<button class="page-btn ${i===PAGE?'active':''}" onclick="goPage(${i})">${i+1}</button>`;
-  if (hi < total_pages-1) btns += `${hi<total_pages-2?'<span style="color:var(--tx-muted);padding:0 4px">…</span>':''}<button class="page-btn" onclick="goPage(${total_pages-1})">${total_pages}</button>`;
-  btns += `<button class="page-btn" onclick="goPage(${PAGE+1})" ${PAGE===total_pages-1?'disabled':''}>→</button>`;
-  cont.innerHTML = btns;
-}
-
-function goPage(p) { PAGE = p; renderTable(); }
-
-function toggleCheck(pi, checked) {
-  if (checked) CHECKED.add(pi); else CHECKED.delete(pi);
-  updateSelCount();
-}
-
-function toggleAll(checked) {
-  // Select / deselect ALL filtered projects across every page
-  FILTERED.forEach(p => {
-    if (checked) CHECKED.add(p._idx); else CHECKED.delete(p._idx);
-  });
-  renderTable();
-}
-
-function syncChkAll() {
-  const el = document.getElementById('chkAll');
-  if (!el) return;
-  const total    = FILTERED.length;
-  const selected = FILTERED.filter(p => CHECKED.has(p._idx)).length;
-  el.checked       = total > 0 && selected === total;
-  el.indeterminate = selected > 0 && selected < total;
-}
-
-function updateSelCount() {
-  const sel   = [...CHECKED];
-  const total = sel.reduce((s,i) => s + PROJECTS[i].cost, 0);
-  document.getElementById('selPill').textContent = `${sel.length.toLocaleString()} selected`;
-  document.getElementById('selCost').textContent  = `${fmt(total)} total cost`;
-  updateActionBar();
-}
-
-function preselectTop() {
-  CHECKED.clear();
-  // Select top-50 by benefit score
-  [...PROJECTS]
-    .map((p,i)=>({i, b:p.benefit, c:p.cost}))
-    .sort((a,b)=>b.b-a.b||a.c-b.c)
-    .slice(0,50)
-    .forEach(x=>CHECKED.add(x.i));
-  renderTable();
-}
-
-function bcolor(b) {
-  if (b >= 9)  return '#16A34A';
-  if (b >= 7)  return '#0284C7';
-  if (b >= 5)  return '#B45309';
-  return '#9CA3AF';
-}
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-
-// ── Run algorithms ────────────────────────────────────────────────────────
-async function runAlgos() {
-  const selected_indices = [...CHECKED];
-  if (!selected_indices.length) {
-    showMsg('warn', 'Select at least one project in step 3 before running.');
-    document.getElementById('stepProjects').scrollIntoView({block:'center'});
-    return;
-  }
-  const algos = Object.keys(activeAlgos).filter(k => activeAlgos[k]);
-  if (!algos.length) {
-    showMsg('warn', 'Select at least one algorithm in step 4 before running.');
-    document.getElementById('setup').scrollIntoView({block:'center'});
-    return;
-  }
-  clearMsg();
-
-  const trials = getTrials();
-
-  const btn = document.getElementById('runBtn');
-  btn.innerHTML = '<span class="spinner"></span>Running…';
-  btn.disabled = true;
-
-  const pw = document.getElementById('progressWrap');
-  const pf = document.getElementById('progressFill');
-  const pl = document.getElementById('progressLabel');
-  pw.style.display = 'block';
-  pf.style.width = '10%';
-  pl.textContent = 'Sending request to server…';
-
-  try {
-    const payload = {
-      ds:       DS,
-      budget:   BUDGET,
-      selected: selected_indices,
-      algos:    algos,
-      trials:   trials,
-      pop_size: 60,
-      gens:     100,
-      mut_rate: 0.03,
-    };
-
-    pf.style.width = '30%';
-    pl.textContent = trials > 1
-      ? `Running ${trials} independent runs per algorithm…`
-      : 'Running algorithms on server…';
-
-    const resp = await fetch('/api/run', {
-      method:  'POST',
-      headers: {'Content-Type':'application/json'},
-      body:    JSON.stringify(payload),
-    });
-
-    pf.style.width = '80%';
-    pl.textContent = 'Processing results…';
-
-    const data = await resp.json();
-    if (data.error) throw new Error(data.error);
-
-    pf.style.width = '100%';
-    currentTab = data.results.length - 1;
-    renderResults(data);
-    renderHistory(data.history);
-    loadStats();
-
-  } catch(err) {
-    document.getElementById('results').innerHTML =
-      `<div class="banner warn"><span>⚠</span> Error: ${escHtml(err.message)}</div>`;
-  } finally {
-    btn.disabled = false;
-    updateActionBar();
-    setTimeout(()=>{ pw.style.display='none'; pf.style.width='0%'; }, 800);
-  }
-}
-
-function renderResults(data) {
-  const results    = data.results;
-  const sel_items  = data.selected_items;
-  const budget_used = data.budget;
-
-  const benefits = results.map(r=>r.total_benefit);
-  const maxBen   = Math.max(...benefits);
-  const minBen   = Math.min(...benefits);
-  const allMatch = benefits.every(b=>b===maxBen);
-  const gapPct   = maxBen>0 ? (maxBen-minBen)/maxBen*100 : 0;
-
-  // A small gap (< 1%) is almost always the standard DP's discretization
-  // rounding (it works on a bucketed cost axis), not a GA convergence
-  // problem - the exact methods (B&B, B&B+GA) always agree with each other.
-  const banner = results.length === 1
-    ? `<div class="banner ok"><span>✓</span> ${escHtml(results[0].label)} reached a benefit score of ${maxBen.toFixed(2)}.</div>`
-    : allMatch
-    ? `<div class="banner ok"><span>✓</span> All algorithms reached the same optimal benefit score (${maxBen.toFixed(2)}) — results are consistent.</div>`
-    : gapPct < 1.0
-    ? `<div class="banner ok"><span>✓</span> Branch-and-Bound methods agree on the optimum (${maxBen.toFixed(2)}); standard DP is within ${gapPct.toFixed(3)}% due to its discretized cost axis — expected behaviour.</div>`
-    : `<div class="banner warn"><span>⚠</span> Benefit scores differ by ${gapPct.toFixed(2)}%. For very large selections, standard DP uses a coarser cost grid; B&B and B&B+GA remain exact.</div>`;
-
-  const barColors = ['#4F6EF7','#0284C7','#7C3AED'];
-  const ccards = results.map((r,ri)=>{
-    const isBest = r.total_benefit === maxBen;
-    const tc = r.selected.reduce((s,i)=>s+sel_items[i].cost,0);
-    const pct = maxBen>0 ? Math.round((r.total_benefit/maxBen)*100) : 0;
-    const bc = isBest ? '#16A34A' : barColors[ri % barColors.length];
-    const hasNodes = r.pruning_rate != null;
-    const ntOpen = hasNodes && _expandedNodes.has(ri);
-    return `<div class="ccard ${isBest?'best':''}">
-      <div class="ccard-eye">${isBest?'<div class="best-tag">✓ Optimal</div>':''}</div>
-      <div class="ccard-title">${escHtml(r.label)}</div>
-      <div class="ccard-big">${r.total_benefit.toFixed(2)}</div>
-      <div class="ccard-sub">total benefit score</div>
-      <div class="bar-t"><div class="bar-f" style="width:${pct}%;background:${bc}"></div></div>
-      <div class="ccard-div"></div>
-      <div class="ccard-row"><span class="lbl">Budget used</span><span class="val ${isBest?'hl-green':'hl'}">${fmtB(tc)}</span></div>
-      <div class="ccard-row"><span class="lbl">Projects</span><span class="val">${r.selected.length}</span></div>
-      <div class="ccard-row"><span class="lbl">Runtime</span><span class="val hl">${r.runtime_ms!=null ? r.runtime_ms.toFixed(1)+' ms' : 'N/A'}</span></div>
-      <div class="ccard-row"><span class="lbl">Execution time</span><span class="val">${r.exec_ms!=null ? r.exec_ms.toFixed(1)+' ms' : 'N/A'}</span></div>
-      <div class="ccard-row ${hasNodes?'node-row':''} ${ntOpen?'open':''}" id="nt-btn-${ri}" ${hasNodes?`onclick="toggleNodes(${ri})"`:''}><span class="lbl">Pruning rate${hasNodes?'<span class="nt-caret">▸</span>':''}</span><span class="val ${r.pruning_rate!=null?'hl-green':''}">${r.pruning_rate!=null ? r.pruning_rate.toFixed(2)+'%' : 'N/A'}</span></div>
-      <div class="node-detail" id="nt-${ri}" style="display:${ntOpen?'block':'none'}">
-        <div class="ccard-row"><span class="lbl">Nodes explored</span><span class="val">${r.nodes_generated!=null ? r.nodes_generated.toLocaleString() : 'N/A'}</span></div>
-        <div class="ccard-row"><span class="lbl">Nodes pruned</span><span class="val ${r.nodes_pruned!=null?'hl-green':''}">${r.nodes_pruned!=null ? r.nodes_pruned.toLocaleString() : 'N/A'}</span></div>
-      </div>
-      <div class="ccard-row"><span class="lbl">Time</span><span class="val">${escHtml(r.time_complexity)}</span></div>
-      <div class="ccard-row"><span class="lbl">Space</span><span class="val">${escHtml(r.space_complexity)}</span></div>
-    </div>`;
-  }).join('');
-
-
-  const cr   = results[currentTab] || results[results.length-1];
-  const cset = new Set(cr.selected);
-  const ctc  = cr.selected.reduce((s,i)=>s+sel_items[i].cost,0);
-
-  const tabs = results.map((r,i)=>
-    `<div class="algo-tab ${currentTab===i?'on':''}" onclick="switchTab(${i})">${escHtml(r.label)}</div>`
-  ).join('');
-
-  const chips = sel_items.map((p,i)=>`
-    <div class="res-chip ${cset.has(i)?'sel':'rej'}">
-      <span class="s-badge s-${p.sector.replace(/ /g,'-')}">${p.sector}</span>
-      <span class="res-name">${escHtml(p.name)}</span>
-      <span class="res-cost">${fmt(p.cost)}</span>
-      <span class="res-score">${p.benefit.toFixed(1)}</span>
-    </div>`).join('');
-
-  document.getElementById('results').innerHTML = `
-    <div class="card fade-in">
-      <div class="card-hdr"><div class="card-title">Algorithm comparison — ${DS==='pasig'?'Pasig City':'Quezon City'}</div></div>
-      ${banner}
-      <div class="deflist">
-        <div><b>Runtime</b> — time the algorithm spends actively executing, excluding setup.</div>
-        <div><b>Execution time</b> — total time to process the data and produce the allocation.</div>
-        <div><b>Pruning rate</b> — share of search-tree branches discarded without exploring.</div>
-      </div>
-      <div class="compare-grid">${ccards}</div>
-    </div>
-    <div class="card fade-in" style="animation-delay:.1s">
-      <div class="card-title" style="margin-bottom:14px">Selected projects</div>
-      <div class="algo-tabs" id="resTabs">${tabs}</div>
-      <div class="stats-bar">
-        <div class="stat"><div class="stat-l">Total benefit</div><div class="stat-v acc">${cr.total_benefit.toFixed(2)}</div><div class="stat-s">utility score</div></div>
-        <div class="stat"><div class="stat-l">Budget used</div><div class="stat-v">${fmtB(ctc)}</div><div class="stat-s">${Math.round((ctc/budget_used)*100)}% of cap</div></div>
-        <div class="stat"><div class="stat-l">Projects funded</div><div class="stat-v">${cr.selected.length}</div><div class="stat-s">of ${sel_items.length} candidates</div></div>
-        <div class="stat"><div class="stat-l">Runtime</div><div class="stat-v">${cr.runtime_ms!=null ? cr.runtime_ms.toFixed(1)+' ms' : 'N/A'}</div><div class="stat-s">active execution only</div></div>
-        <div class="stat"><div class="stat-l">Execution time</div><div class="stat-v">${cr.exec_ms!=null ? cr.exec_ms.toFixed(1)+' ms' : 'N/A'}</div><div class="stat-s">${escHtml(cr.time_complexity)}</div></div>
-        <div class="stat"><div class="stat-l">Nodes explored</div><div class="stat-v">${cr.nodes_generated!=null ? cr.nodes_generated.toLocaleString() : 'N/A'}</div><div class="stat-s">${cr.nodes_generated!=null ? 'search tree size' : 'no B&B tree'}</div></div>
-        <div class="stat"><div class="stat-l">Pruning rate</div><div class="stat-v ${cr.pruning_rate!=null?'acc':''}">${cr.pruning_rate!=null ? cr.pruning_rate.toFixed(2)+'%' : 'N/A'}</div><div class="stat-s">${cr.pruning_rate!=null ? 'branches pruned' : 'no B&B tree'}</div></div>
-      </div>
-      <div class="res-list">${chips}</div>
-    </div>`;
-
-  // Store for tab switching
-  window._lastData = data;
-}
-
-function switchTab(i) {
-  currentTab = i;
-  renderResults(window._lastData);
-}
-
-function toggleNodes(i) {
-  const box = document.getElementById('nt-' + i);
-  const btn = document.getElementById('nt-btn-' + i);
-  if (!box) return;
-  const open = box.style.display === 'none';
-  box.style.display = open ? 'block' : 'none';
-  if (btn) btn.classList.toggle('open', open);
-  if (open) _expandedNodes.add(i); else _expandedNodes.delete(i);
-}
-
-/* ── Inline messaging ────────────────────────────────────────────────
-   Errors are shown in place rather than through alert(), so the user can
-   read the problem and the offending control at the same time. */
-function showMsg(kind, text) {
-  const el = document.getElementById('globalMsg');
-  if (!el) return;
-  const icon = kind === 'err' ? '!' : kind === 'warn' ? '!' : 'i';
-  el.innerHTML = `<div class="msg ${kind}"><span class="msg-icon" aria-hidden="true">${icon}</span><span>${escHtml(text)}</span></div>`;
-}
-
-function clearMsg() {
-  const el = document.getElementById('globalMsg');
-  if (el) el.innerHTML = '';
-}
-
-/* ── Persistent status bar ───────────────────────────────────────────
-   Keeps the run configuration visible at all times and blocks the action
-   before it can fail, stating the reason instead of reporting it after. */
-function updateActionBar() {
-  const selCount = CHECKED.size;
-  const algos    = Object.keys(activeAlgos).filter(k => activeAlgos[k]);
-  const trials   = Math.max(1, Math.min(30, parseInt(document.getElementById('trialsInput').value, 10) || 1));
-
-  const set = (id, val) => {
-    const el = document.getElementById(id);
-    if (el) el.textContent = val;
-  };
-  set('abDs',     DS === 'pasig' ? 'Pasig City' : 'Quezon City');
-  set('abBudget', fmtB(BUDGET));
-  set('abSel',    selCount.toLocaleString());
-  set('abAlgos',  algos.length);
-  set('abTrials', trials);
-
-  const selEl = document.getElementById('abSel');
-  if (selEl) selEl.classList.toggle('warn', selCount === 0);
-  const algEl = document.getElementById('abAlgos');
-  if (algEl) algEl.classList.toggle('warn', algos.length === 0);
-
-  // Error prevention: say what is missing before the button can be pressed.
-  let reason = '';
-  if (!selCount && !algos.length) reason = 'Select at least one project and one algorithm to run.';
-  else if (!selCount)             reason = 'Select at least one project in step 3.';
-  else if (!algos.length)         reason = 'Select at least one algorithm in step 4.';
-
-  const btn = document.getElementById('runBtn');
-  if (btn) {
-    btn.disabled = !!reason;
-    btn.textContent = trials > 1 ? `Run ${trials} times each` : 'Run algorithms';
-  }
-  const rEl = document.getElementById('abReason');
-  if (rEl) rEl.textContent = reason;
-
-  // Reflect progress on the numbered rail.
-  const mark = (id, done) => {
-    const el = document.getElementById(id);
-    if (el) el.classList.toggle('done', done);
-  };
-  mark('stepProjects', selCount > 0);
-  mark('setup',        algos.length > 0);
-}
-
-/* ── Trials control ──────────────────────────────────────────────────── */
-function getTrials() {
-  const el = document.getElementById('trialsInput');
-  let v = parseInt(el.value, 10);
-  if (isNaN(v) || v < 1) v = 1;
-  if (v > 30) v = 30;
-  el.value = v;
-  return v;
-}
-
-function setTrials(n) {
-  document.getElementById('trialsInput').value = n;
-  updateActionBar();
-}
-
-/* ── Run history / experiment log ────────────────────────────────────── */
-let HIST_DATA   = [];     // full combo list incl. per-trial rows
-let HIST_OPEN   = null;   // "ds|algo" of the currently expanded combo
-
-async function loadHistory() {
-  try {
-    const resp = await fetch('/api/history');
-    const data = await resp.json();
-    renderHistory(data.combos);
-  } catch(err) {
-    // Non-fatal: the history panel simply stays empty.
-  }
-}
-
-function histKey(c) { return c.ds + '|' + c.algo; }
-
-function toggleHist(key) {
-  HIST_OPEN = (HIST_OPEN === key) ? null : key;
-  renderHistory(HIST_DATA);
-}
-
-function num(v, dp) {
-  return (v === null || v === undefined) ? '—' : Number(v).toFixed(dp);
-}
-
-/* Mean of a numeric field across a combo's stored runs. */
-function histMean(trials, field) {
-  const vals = trials.map(t => t[field]).filter(v => v !== null && v !== undefined);
-  if (!vals.length) return null;
-  return vals.reduce((a,b) => a+b, 0) / vals.length;
-}
-
-function renderHistory(combos) {
-  const panel = document.getElementById('historyPanel');
-  if (!panel) return;
-
-  HIST_DATA = combos || [];
-  const total = HIST_DATA.reduce((s,c) => s + c.count, 0);
-
-  if (!HIST_DATA.length) {
-    panel.innerHTML = `
-      <div class="card fade-in">
-        <div class="card-hdr">
-          <div class="card-title">Run history</div>
-        </div>
-        <div class="hist-empty">
-          No runs recorded yet.<br>
-          Run an algorithm above — each run's runtime, execution time and
-          pruning rate will be logged here
-          (last 30 runs kept per dataset + algorithm).
-        </div>
-      </div>`;
-    return;
-  }
-
-  // Keep the expanded combo valid; otherwise open the first one by default.
-  if (!HIST_DATA.some(c => histKey(c) === HIST_OPEN)) {
-    HIST_OPEN = histKey(HIST_DATA[0]);
-  }
-
-  const cards = HIST_DATA.map(c => {
-    const key  = histKey(c);
-    const pct  = Math.min(100, Math.round((c.count / 30) * 100));
-    const done = c.complete;
-    const on   = HIST_OPEN === key;
-    return `
-      <div class="hist-card ${done?'done':''} ${on?'on':''}" onclick="toggleHist('${key}')">
-        <div class="hist-algo">${escHtml(c.algo_name)}</div>
-        <div class="hist-ds">${escHtml(c.ds_name)}</div>
-        <span class="hist-count ${done?'done':''}">${c.count}</span>
-        <span class="hist-of"> / 30 runs</span>
-        <div class="hist-bar"><div class="hist-bar-fill ${done?'done':''}" style="width:${pct}%"></div></div>
-      </div>`;
-  }).join('');
-
-  // ── Per-run detail table for the expanded combination ────────────────
-  const combo  = HIST_DATA.find(c => histKey(c) === HIST_OPEN);
-  let detail = '';
-
-  if (combo) {
-    const t = combo.trials;
-    const rows = t.map((r, i) => `
-      <tr>
-        <td class="hr-idx">Run ${i + 1}</td>
-        <td>${num(r.runtime_ms, 2)}</td>
-        <td>${num(r.exec_ms, 2)}</td>
-        <td>${r.pruning_rate === null ? '—' : num(r.pruning_rate, 2)}</td>
-        <td class="hr-dim">${r.nodes_generated === null ? '—' : r.nodes_generated.toLocaleString()}</td>
-        <td class="hr-dim">${r.nodes_pruned === null ? '—' : r.nodes_pruned.toLocaleString()}</td>
-        <td class="hr-dim">${num(r.total_benefit, 2)}</td>
-        <td class="hr-time">${escHtml(r.timestamp.split(' ')[1] || '')}</td>
-      </tr>`).join('');
-
-    const mRun  = histMean(t, 'runtime_ms');
-    const mExec = histMean(t, 'exec_ms');
-    const mPrun = histMean(t, 'pruning_rate');
-    const mBen  = histMean(t, 'total_benefit');
-
-    detail = `
-      <div class="hist-detail">
-        <div class="hist-detail-hdr">
-          <span class="hd-title">${escHtml(combo.algo_name)} · ${escHtml(combo.ds_name)}</span>
-          <span class="hd-sub">${combo.count} run${combo.count===1?'':'s'} stored</span>
-        </div>
-        <div class="hist-table-wrap">
-          <table class="hist-table">
-            <thead>
-              <tr>
-                <th>Trial</th>
-                <th>Runtime (ms)</th>
-                <th>Execution time (ms)</th>
-                <th>Pruning rate (%)</th>
-                <th>Nodes explored</th>
-                <th>Nodes pruned</th>
-                <th>Total benefit</th>
-                <th>Time</th>
-              </tr>
-            </thead>
-            <tbody>${rows}</tbody>
-            <tfoot>
-              <tr>
-                <td class="hr-idx">Mean</td>
-                <td>${num(mRun, 4)}</td>
-                <td>${num(mExec, 4)}</td>
-                <td>${mPrun === null ? '—' : num(mPrun, 4)}</td>
-                <td class="hr-dim">—</td>
-                <td class="hr-dim">—</td>
-                <td class="hr-dim">${num(mBen, 4)}</td>
-                <td class="hr-time"></td>
-              </tr>
-            </tfoot>
-          </table>
-        </div>
-      </div>`;
-  }
-
-  panel.innerHTML = `
-    <div class="card fade-in">
-      <div class="card-hdr">
-        <div class="card-title">Run history — ${total} run${total===1?'':'s'} recorded</div>
-        <div class="hist-actions">
-          <button class="hist-btn export" onclick="exportExcel()">⬇ Export to Excel</button>
-          <button class="hist-btn danger" onclick="clearHistory()">Clear history</button>
-        </div>
-      </div>
-      <div class="hist-grid">${cards}</div>
-      ${detail}
-    </div>`;
-}
-
-function exportExcel() {
-  // Triggers a normal browser download from /api/export.
-  window.location.href = '/api/export';
-}
-
-async function clearHistory() {
-  if (!confirm('Clear all recorded runs? This cannot be undone — export first if you still need the data.')) return;
-  try {
-    const resp = await fetch('/api/history/clear', {
-      method:  'POST',
-      headers: {'Content-Type':'application/json'},
-      body:    JSON.stringify({}),
-    });
-    const data = await resp.json();
-    renderHistory(data.combos);
-    loadStats();
-  } catch(err) {
-    showMsg('err', 'Could not clear the history: ' + err.message);
-  }
-}
-
-/* ── Statistical report ──────────────────────────────────────────────
-   Implements Figure 6's "Analysis and Logging Module" output: the paired
-   t-test (KB vs KBG) and the independent t-test / efficiency ratio across
-   dataset sizes. Computed server-side from the recorded runs. */
-async function loadStats() {
-  try {
-    const resp = await fetch('/api/stats');
-    renderStats(await resp.json());
-  } catch(err) { /* non-fatal */ }
-}
-
-function fx(v, dp) {
-  return (v === null || v === undefined) ? '—' : Number(v).toFixed(dp);
-}
-
-/* p-values here span many orders of magnitude, so very small ones are shown
-   in scientific notation rather than rounding to a misleading 0.0000. */
-function fp(v) {
-  if (v === null || v === undefined) return null;
-  if (v < 0.0001) return v.toExponential(2);
-  return v.toFixed(4);
-}
-
-function verdict(row) {
-  if (row.p === null || row.p === undefined) {
-    return '<span class="vd none" title="Metric is constant across runs">not computable</span>';
-  }
-  return row.significant
-    ? '<span class="vd sig">significant</span>'
-    : '<span class="vd ns">not significant</span>';
-}
-
-function renderStats(rep) {
-  const panel = document.getElementById('statsPanel');
-  if (!panel) return;
-
-  const hasEff  = rep.efficiency && rep.efficiency.length;
-  const hasComp = rep.comparison && rep.comparison.length;
-
-  if (!hasEff && !hasComp) {
-    panel.innerHTML = `
-      <div class="card">
-        <div class="empty-state">
-          <p>No statistics yet.</p>
-          <p class="es-sub">The efficiency ratio needs runs on <b>both</b> datasets, and the
-          paired t-test needs runs of <b>both</b> B&amp;B and B&amp;B+GA. Record at least two runs
-          of each, then the report appears here.</p>
-        </div>
-      </div>`;
-    return;
-  }
-
-  let html = '';
-
-  if (hasComp) {
-    const blocks = rep.comparison.map(g => `
-      <div class="stat-block">
-        <div class="sb-title">${escHtml(g.ds_name)}</div>
-        <div class="stat-table-wrap">
-        <table class="hist-table">
-          <thead><tr>
-            <th>Metric</th><th>Mean (KB)</th><th>Mean (KBG)</th>
-            <th>Mean diff.</th><th>SD of diff.</th><th>t</th><th>p</th><th>Result</th>
-          </tr></thead>
-          <tbody>
-            ${g.rows.map(r => `
-              <tr>
-                <td class="hr-idx">${escHtml(r.metric)}</td>
-                <td>${fx(r.mean_a,4)}</td>
-                <td>${fx(r.mean_b,4)}</td>
-                <td>${fx(r.mean_diff,4)}</td>
-                <td>${fx(r.sd_diff,4)}</td>
-                <td>${r.t===null||r.t===undefined?'—':fx(r.t,4)}</td>
-                <td>${fp(r.p) ?? '—'}</td>
-                <td>${verdict(r)}</td>
-              </tr>`).join('')}
-          </tbody>
-        </table></div>
-      </div>`).join('');
-
-    html += `
-      <div class="card">
-        <div class="card-hdr"><div class="card-title">Paired t-test — B&amp;B vs. B&amp;B + GA</div></div>
-        <p class="stat-lede">Tests whether the hybrid differs significantly from branch-and-bound alone.
-        Runs are paired by problem instance: both solve the identical project set under the identical budget.
-        Null hypothesis rejected when p &lt; 0.05.</p>
-        ${blocks}
-      </div>`;
-  }
-
-  if (hasEff) {
-    const blocks = rep.efficiency.map(g => `
-      <div class="stat-block">
-        <div class="sb-title">${escHtml(g.algo_name)}</div>
-        <div class="stat-table-wrap">
-        <table class="hist-table">
-          <thead><tr>
-            <th>Metric</th><th>Mean (Pasig)</th><th>Mean (QC)</th>
-            <th>Ratio</th><th>t</th><th>df</th><th>p</th><th>Result</th>
-          </tr></thead>
-          <tbody>
-            ${g.rows.map(r => `
-              <tr>
-                <td class="hr-idx">${escHtml(r.metric)}</td>
-                <td>${fx(r.mean_1,4)}</td>
-                <td>${fx(r.mean_2,4)}</td>
-                <td>${fx(r.ratio,4)}</td>
-                <td>${r.t===null||r.t===undefined?'—':fx(r.t,4)}</td>
-                <td>${fx(r.df,2)}</td>
-                <td>${fp(r.p) ?? '—'}</td>
-                <td>${verdict(r)}</td>
-              </tr>`).join('')}
-          </tbody>
-        </table></div>
-      </div>`).join('');
-
-    html += `
-      <div class="card">
-        <div class="card-hdr"><div class="card-title">Independent t-test — efficiency across dataset sizes</div></div>
-        <p class="stat-lede">Efficiency is the ratio of each optimality parameter on the small dataset
-        relative to the large one. A result that is <i>not</i> significant indicates performance is stable
-        across input sizes.</p>
-        ${blocks}
-      </div>`;
-  }
-
-  html += `
-    <div class="msg info" style="margin-top:14px">
-      <span class="msg-icon" aria-hidden="true">i</span>
-      <span>Two-tailed tests at the 0.05 level. "Not computable" means the metric is constant
-      across runs, so its standard deviation is zero — expected for the pruning rate of
-      branch-and-bound, which is deterministic, and not a data error.</span>
-    </div>`;
-
-  panel.innerHTML = html;
-}
-
-init();
-loadHistory();
-loadStats();
-</script>
-</body>
-</html>"""
 
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    return render_template('index.html')
 
 
 @app.route("/api/meta")
@@ -2831,10 +1573,12 @@ def api_run():
     ds        = body.get("ds", "pasig")
     budget    = float(body.get("budget", 5_000_000_000))
     sel_idx   = body.get("selected", [])
-    algos     = body.get("algos", ["dp","bnb","ga"])
+    algos     = body.get("algos", ["bnb", "ga"])
     pop_size  = int(body.get("pop_size", 40))
     gens      = int(body.get("gens", 60))
-    mut_rate  = float(body.get("mut_rate", 0.03))
+    mut_rate  = body.get("mut_rate")
+    mut_rate  = None if mut_rate in (None, "") else float(mut_rate)
+    session   = str(body.get("session") or "")
 
     all_data = DATASETS.get(ds, DATASETS["pasig"])["data"]
     items    = [all_data[i] for i in sel_idx if i < len(all_data)]
@@ -2845,15 +1589,6 @@ def api_run():
     if not isinstance(algos, list) or not algos:
         return jsonify({"error": "No algorithms selected."}), 400
 
-    ALGO_META = {
-        "dp":  {"label": "Knapsack (DP)",      "time": "O(n·W)",               "space": "O(n·W)"},
-        "bnb": {"label": "Knapsack + B&B",     "time": "O(2ⁿ) worst-case",     "space": "O(n)"},
-        # Figure 6 of the manuscript states the hybrid's complexity as
-        # Time O(g·p·n + 2ⁿ) bounded by GA pruning, and Space O(p·n + n)
-        # for the priority queue plus the population. Kept verbatim so a live
-        # demo matches the architecture diagram.
-        "ga":  {"label": "Knapsack + B&B + GA","time": "O(g·p·n + 2ⁿ) bounded by GA pruning","space": "O(p·n + n)"},
-    }
 
     # Number of independent repetitions per algorithm for this request.
     # Default 1 preserves the original single-run demo behaviour; setting it
@@ -2864,14 +1599,13 @@ def api_run():
     ga_params = {"pop_size": pop_size, "gens": gens, "mut_rate": mut_rate}
 
     results = []
+    staged  = {}     # funded lists are published only after every algorithm finishes
     for algo in algos:
         if algo not in ALGO_META:
             continue
         for _trial in range(trials):
             t0 = time.perf_counter()
-            if algo == "dp":
-                res = knapsack_dp(items, budget)
-            elif algo == "bnb":
+            if algo == "bnb":
                 res = knapsack_bnb(items, budget)
             else:
                 res = knapsack_bnb_ga(items, budget,
@@ -2879,18 +1613,22 @@ def api_run():
                                       generations=gens,
                                       mutation_rate=mut_rate)
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            entry = _build_result_entry(algo, res, elapsed_ms, ALGO_META)
+            entry = _build_result_entry(algo, res, elapsed_ms)
             # Attach the source project codes for the chosen combination, so
             # every allocation can be traced back to the LGU procurement plan.
             entry["project_ids"] = [
                 items[i].get("code", "") for i in res["selected"]
             ]
             record_trial(ds, algo, entry, budget, len(items), ga_params)
+            staged[algo] = res["selected"]
         # Only the final repetition is surfaced in the response payload.
         results.append(entry)
 
     if not results:
         return jsonify({"error": "No valid algorithms selected."}), 400
+
+    for a, selected in staged.items():
+        record_funded(ds, a, items, selected, budget, session)
 
     return jsonify({
         "results":       results,
@@ -2902,7 +1640,7 @@ def api_run():
     })
 
 
-def _build_result_entry(algo, res, elapsed_ms, ALGO_META):
+def _build_result_entry(algo, res, elapsed_ms, _meta=None):
     """Assemble one result dict with manuscript-aligned metric labels.
 
     ── Manuscript-aligned labeling (Ch.1 Definition of Terms) ──────────────
@@ -2936,7 +1674,335 @@ def _build_result_entry(algo, res, elapsed_ms, ALGO_META):
         "nodes_generated":  res.get("nodes_generated"),
         "nodes_pruned":     res.get("nodes_pruned"),
         "ga_terminated":    res.get("ga_terminated", False),
+        # Best fitness after each GA generation, for the convergence plot.
+        "convergence":      res.get("convergence"),
+        "ga_seed":          res.get("ga_seed"),
     }
+
+
+@app.route("/api/run/stream", methods=["POST"])
+def api_run_stream():
+    """Run the trials and stream live progress as Server-Sent Events.
+
+    Why trials are INTERLEAVED rather than run in parallel
+    ------------------------------------------------------
+    The obvious way to "run both at the same time" is a thread per algorithm.
+    That would be wrong here. CPython holds a global interpreter lock, so two
+    CPU-bound knapsack solvers in threads do not run simultaneously - they
+    take turns, competing for the same core, and each one's measured runtime
+    is inflated by however long the other held the lock. Runtime and execution
+    time are precisely what the study's paired t-test compares, so contaminated
+    timings would invalidate the results.
+
+    Instead the loop interleaves by trial: trial 1 of every algorithm, then
+    trial 2, and so on. Only one algorithm computes at any instant, so each
+    measurement is as clean as the sequential path, while every algorithm's
+    progress advances together in real time. Each algorithm's result is
+    emitted the moment it finishes its own final trial, so a faster algorithm
+    reports without waiting for a slower one.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    ds       = body.get("ds", "pasig")
+    data     = PASIG_DATA if ds == "pasig" else QC_DATA
+    budget   = float(body.get("budget", 0) or 0)
+    sel      = body.get("selected") or []
+    algos    = body.get("algos") or ["bnb", "ga"]
+    pop_size = int(body.get("pop_size", 60))
+    gens     = int(body.get("gens", 100))
+    mut_rate = body.get("mut_rate")
+    mut_rate = None if mut_rate in (None, "") else float(mut_rate)
+    trials   = max(1, min(TRIALS_PER_COMBO, int(body.get("trials", 1))))
+    session  = str(body.get("session") or "")
+
+    items = [data[i] for i in sel if 0 <= i < len(data)]
+    algos = [a for a in algos if a in ALGO_META]
+
+    if not items or not algos:
+        return jsonify({"error": "Select at least one project and one algorithm."}), 400
+
+    ga_params = {"pop_size": pop_size, "gens": gens, "mut_rate": mut_rate}
+
+    def sse(payload):
+        return f"data: {json.dumps(payload)}\n\n"
+
+    def generate():
+        yield sse({"type": "start", "algos": algos, "trials": trials,
+                   "labels": {a: ALGO_META[a]["label"] for a in algos},
+                   "n_items": len(items)})
+
+        # Running tallies so the UI can show a live mean per algorithm.
+        acc  = {a: {"runtime": [], "exec": [], "pruning": []} for a in algos}
+        last = {}
+        # Allocations are held back until EVERY algorithm has finished, so the
+        # funded browser never shows a half-finished run. A run that is
+        # interrupted publishes nothing.
+        staged = {}
+
+        for t in range(trials):
+            for algo in algos:
+                t0 = time.perf_counter()
+                if algo == "bnb":
+                    res = knapsack_bnb(items, budget)
+                else:
+                    res = knapsack_bnb_ga(items, budget, pop_size=pop_size,
+                                          generations=gens, mutation_rate=mut_rate)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+
+                entry = _build_result_entry(algo, res, elapsed_ms)
+                entry["project_ids"] = [items[i].get("code", "") for i in res["selected"]]
+                record_trial(ds, algo, entry, budget, len(items), ga_params)
+                staged[algo] = res["selected"]
+                last[algo] = entry
+
+                acc[algo]["runtime"].append(entry["runtime_ms"])
+                acc[algo]["exec"].append(entry["exec_ms"])
+                if entry.get("pruning_rate") is not None:
+                    acc[algo]["pruning"].append(entry["pruning_rate"])
+
+                mean = lambda v: (sum(v) / len(v)) if v else None
+                yield sse({
+                    "type": "progress", "algo": algo,
+                    "trial": t + 1, "trials": trials,
+                    "runtime_ms": entry["runtime_ms"],
+                    "exec_ms": entry["exec_ms"],
+                    "pruning_rate": entry.get("pruning_rate"),
+                    "mean_runtime": mean(acc[algo]["runtime"]),
+                    "mean_exec": mean(acc[algo]["exec"]),
+                    "mean_pruning": mean(acc[algo]["pruning"]),
+                    "total_benefit": entry["total_benefit"],
+                })
+
+                # This algorithm has finished all of its trials - report now.
+                if t + 1 == trials:
+                    yield sse({"type": "result", "algo": algo, "result": entry})
+
+        # Every algorithm has finished: publish the funded lists now.
+        for a, selected in staged.items():
+            record_funded(ds, a, items, selected, budget, session)
+
+        yield sse({
+            "type": "done",
+            "ds": ds, "budget": budget, "trials": trials,
+            "selected_items": items,
+            "results": [last[a] for a in algos if a in last],
+            "history": history_summary(),
+        })
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # No "Connection: keep-alive" here: the development server closes
+            # the connection after a stream and adds "Connection: close"
+            # itself. Sending both made the browser reuse a closing
+            # connection, so the next request (funded list, stats) could hang.
+            # Stops nginx-style proxies buffering the stream into one chunk.
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-allocation verification and comparative review
+#
+# Implements step 7 of the Data Generation/Gathering Procedure. The manuscript
+# specifies a MANUAL verification phase, so this module does not replace that
+# judgement - it supplies the material the reviewer works from:
+#
+#   1. Automated integrity checks over EVERY selected project (traceability to
+#      the source plan, budget compliance, arithmetic consistency). These are
+#      mechanical facts a script can establish.
+#   2. Sector alignment: each sector's share of the published plan against its
+#      share of the funded set, which is the evidence for whether the
+#      allocation reflects the LGU's own priorities.
+#   3. Comparative review of the two cities, for the scaling question.
+#   4. The manual judgement itself is recorded in the exported workbook: the
+#      funded-project sheets carry Reviewer verdict and Reviewer note columns,
+#      so the reviewer works over the complete allocation in Excel with
+#      filtering and sorting rather than over a sample in the browser.
+#
+# The distinction matters: a script can verify that a project exists in the
+# source plan; only a reviewer can judge whether the allocation "aligns with
+# realistic public policy demands."
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _selection_for(ds, budget, selected_idx, algo_selected):
+    data = PASIG_DATA if ds == "pasig" else QC_DATA
+    items = [data[i] for i in selected_idx if 0 <= i < len(data)]
+    return items, [items[i] for i in algo_selected if 0 <= i < len(items)]
+
+
+def verification_checks(ds, candidates, funded, budget):
+    """Mechanical checks over every funded project. Returns pass/fail rows."""
+    data = PASIG_DATA if ds == "pasig" else QC_DATA
+    source_codes = collections_Counter(str(p.get("code", "")).strip() for p in data)
+
+    total_cost = sum(float(p["cost"]) for p in funded)
+    total_benefit = sum(compute_benefit(p) for p in funded)
+
+    traceable = sum(1 for p in funded
+                    if source_codes.get(str(p.get("code", "")).strip(), 0) > 0)
+    positive_cost = sum(1 for p in funded if float(p["cost"]) > 0)
+    scored = sum(1 for p in funded if 0 <= compute_benefit(p) <= 10)
+
+    n = len(funded)
+    rows = [
+        {"check": "Every funded project appears in the source Annual Procurement Plan",
+         "result": f"{traceable:,} of {n:,}", "pass": traceable == n},
+        {"check": "Every funded project has a positive estimated budget",
+         "result": f"{positive_cost:,} of {n:,}", "pass": positive_cost == n},
+        {"check": "Every social benefit value falls within the 0-10 scale",
+         "result": f"{scored:,} of {n:,}", "pass": scored == n},
+        {"check": "Total cost of the funded set is within the budget ceiling",
+         "result": f"PHP {total_cost:,.2f} of PHP {budget:,.2f}",
+         "pass": total_cost <= budget + 1e-6},
+        {"check": "No project is funded more than once",
+         "result": f"{len({id(p) for p in funded}):,} distinct entries",
+         "pass": len({id(p) for p in funded}) == n},
+    ]
+    return rows, total_cost, total_benefit
+
+
+def sector_alignment(ds, candidates, funded):
+    """Share of each sector in the candidate plan vs in the funded set."""
+    allc = collections_Counter(p["sector"] for p in candidates)
+    selc = collections_Counter(p["sector"] for p in funded)
+
+    # Spend per sector, for the budget utilization chart: a sector can hold
+    # many projects yet little spend, or few projects yet a large share.
+    spend = {}
+    for p in funded:
+        spend[p["sector"]] = spend.get(p["sector"], 0.0) + float(p["cost"])
+    plan_cost = {}
+    for p in candidates:
+        plan_cost[p["sector"]] = plan_cost.get(p["sector"], 0.0) + float(p["cost"])
+    total_spend = sum(spend.values())
+
+    out = []
+    for sector, in_plan in allc.most_common():
+        got = selc.get(sector, 0)
+        out.append({
+            "sector":        sector,
+            "in_plan":       in_plan,
+            "funded":        got,
+            "funded_pct":    (got / in_plan * 100) if in_plan else 0.0,
+            "share_plan":    (in_plan / len(candidates) * 100) if candidates else 0.0,
+            "share_funded":  (got / len(funded) * 100) if funded else 0.0,
+            "funded_cost":   spend.get(sector, 0.0),
+            "plan_cost":     plan_cost.get(sector, 0.0),
+            "share_spend":   (spend.get(sector, 0.0) / total_spend * 100) if total_spend else 0.0,
+        })
+    return out
+
+
+@app.route("/api/review", methods=["POST"])
+def api_review():
+    """Verification material for one allocation."""
+    body = request.get_json(force=True, silent=True) or {}
+    ds       = body.get("ds", "pasig")
+    budget   = float(body.get("budget", 0) or 0)
+    sel      = body.get("selected") or []          # candidate pool indices
+    funded_i = body.get("funded") or []            # indices into the candidate pool
+
+    candidates, funded = _selection_for(ds, budget, sel, funded_i)
+    if not candidates:
+        return jsonify({"error": "No candidate projects to review."}), 400
+
+    checks, total_cost, total_benefit = verification_checks(ds, candidates, funded, budget)
+    sectors = sector_alignment(ds, candidates, funded)
+
+    return jsonify({
+        "ds": ds, "budget": budget,
+        "candidates": len(candidates), "funded": len(funded),
+        "total_cost": total_cost, "total_benefit": total_benefit,
+        "benefit_per_million": (total_benefit / (total_cost / 1e6)) if total_cost else 0.0,
+        "checks": checks,
+        "sectors": sectors,
+    })
+
+
+@app.route("/api/funded")
+def api_funded():
+    """Browse the funded projects of the most recent run, page by page.
+
+    Paged on the server because a Quezon City allocation can exceed 25,000
+    projects, which is far more than is sensible to ship to the browser in
+    one response.
+    """
+    ds     = request.args.get("ds", "pasig")
+    algo   = request.args.get("algo", "ga")
+    q      = request.args.get("q", "").strip().lower()
+    sector = request.args.get("sector", "All")
+    sort   = request.args.get("sort", "benefit")
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except ValueError:
+        page = 1
+    per = 50
+
+    session = request.args.get("session")
+
+    def _mine(rec):
+        # With a session id, show only what this page has run. Without one
+        # (older callers), show everything on record.
+        return session is None or rec.get("session", "") == session
+
+    available = [
+        {"ds": d, "algo": a, "ds_name": DS_NAMES[d], "algo_name": ALGO_SHEET_NAMES[a],
+         "count": len(FUNDED_LATEST[f"{d}|{a}"]["items"])}
+        for a in ALGO_SHEET_NAMES for d in ("pasig", "qc")
+        if f"{d}|{a}" in FUNDED_LATEST and _mine(FUNDED_LATEST[f"{d}|{a}"])
+    ]
+
+    rec = FUNDED_LATEST.get(f"{ds}|{algo}")
+    if rec and not _mine(rec):
+        rec = None
+    if not rec:
+        return jsonify({"rows": [], "total": 0, "page": 1, "pages": 0,
+                        "available": available, "sectors": [],
+                        "sum_cost": 0, "sum_benefit": 0, "budget": 0})
+
+    items = rec["items"]
+    sectors = sorted({p.get("sector", "") for p in items})
+
+    rows = items
+    if sector and sector != "All":
+        rows = [p for p in rows if p.get("sector") == sector]
+    if q:
+        rows = [p for p in rows
+                if q in str(p.get("name", "")).lower()
+                or q in str(p.get("pmo", "")).lower()
+                or q in str(p.get("code", "")).lower()]
+
+    keyed = [(p, compute_benefit(p), float(p["cost"])) for p in rows]
+    if sort == "cost":
+        keyed.sort(key=lambda t: t[2], reverse=True)
+    elif sort == "ratio":
+        keyed.sort(key=lambda t: (t[1] / (t[2] / 1e6)) if t[2] else 0, reverse=True)
+    elif sort == "name":
+        keyed.sort(key=lambda t: str(t[0].get("name", "")))
+    else:
+        keyed.sort(key=lambda t: t[1], reverse=True)
+
+    total = len(keyed)
+    pages = max(1, -(-total // per))
+    page = min(page, pages)
+    window = keyed[(page - 1) * per: page * per]
+
+    return jsonify({
+        "available": available, "sectors": sectors,
+        "ds": ds, "algo": algo, "budget": rec["budget"],
+        "total": total, "page": page, "pages": pages,
+        "sum_cost": sum(t[2] for t in keyed),
+        "sum_benefit": sum(t[1] for t in keyed),
+        "rows": [{
+            "code": str(p.get("code", "")), "name": p.get("name", ""),
+            "pmo": p.get("pmo", ""), "sector": p.get("sector", ""),
+            "cost": cost, "benefit": round(ben, 3),
+            "ratio": round(ben / (cost / 1e6), 3) if cost else None,
+        } for p, ben, cost in window],
+    })
 
 
 @app.route("/api/history")
@@ -2956,8 +2022,10 @@ def api_history_clear():
     algo = body.get("algo")
     if ds and algo:
         RUN_HISTORY.pop(_history_key(ds, algo), None)
+        FUNDED_LATEST.pop(f"{ds}|{algo}", None)
     else:
         RUN_HISTORY.clear()
+        FUNDED_LATEST.clear()
     return jsonify({"ok": True, "combos": history_summary()})
 
 
@@ -2970,8 +2038,9 @@ def api_stats():
 @app.route("/api/export")
 def api_export():
     """Download the recorded trials as a formatted Excel workbook."""
+    combined = request.args.get("combined", "1").lower() not in ("0", "false", "no")
     try:
-        buf = build_workbook()
+        buf = build_workbook(include_combined=combined)
     except ImportError:
         return jsonify({
             "error": "openpyxl is not installed. Run:  pip install openpyxl"
@@ -2988,9 +2057,9 @@ def api_export():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("LGU Budget Optimizer — Thesis Group 2 BSCS 3-1N")
+    print("LGU Budget Optimizer — Thesis Group 2 BSCS 4-1N")
     print(f"  Pasig City:  {len(PASIG_DATA):,} projects")
     print(f"  Quezon City: {len(QC_DATA):,} projects")
     print("=" * 60)
     print("Open http://127.0.0.1:5000 in your browser")
-    app.run(debug=False, port=5000)
+    app.run(debug=False, port=5000, threaded=True)
